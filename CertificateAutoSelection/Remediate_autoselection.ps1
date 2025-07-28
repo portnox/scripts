@@ -13,7 +13,7 @@ $CertificateIssuer = '<YOUR_ORGID>'
 $AutoSelectionPatterns = @(
     '[*.]appaccess.portnox.com'
     '[*.]pa.portnox.com'
-    # Put here your custom URLs for AAC applications
+    # Put here your custom URLs for Hosted applications
 )
 
 # Where is OrgId stored in the certificate issuer
