@@ -1,6 +1,10 @@
 ########################################
 # The following script performs connectivity tests to verify all nessesary IPs and ports are accessible by the local RADIUS
 # The scrit should be executed on the Docker host running the local RADIUS, or from within the Local RADIUS virtual appliance
+# Download this script to the Linux machine using wget OR curl using the folowing examples: 
+# - "wget https://raw.githubusercontent.com/portnox/scripts/refs/heads/main/localradfwtest.sh && chmod +x localradfwtest.sh && ./localradfwtest.sh" 
+# - "curl -o localradfwtest.sh https://raw.githubusercontent.com/portnox/scripts/refs/heads/main/localradfwtest.sh && chmod +x localradfwtest.sh && ./localradfwtest.sh"
+# Be sure to copy the entire command from the open quote to the close quote to make the script executable and launch the script
 ########################################
 
 #!/usr/bin/env bash
