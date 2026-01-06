@@ -1,8 +1,12 @@
 ########################################
-# To execute the script run the commmand: 
-# The script must be run under sudo
-# When prompted enter your customer name
+# The following script collects Docker logs from all Portnox containers running on the Docker host it's executed on. Those log files are then automatically uploaded to Portnox for review by support
+# The script should be executed on the Docker host running Portnox containers, such as the Local RADIUS, TACACS+, ZTNA, Unifi Agent, SiEM, etc.
+# To execute the script run the commmand in its entirety: "wget https://raw.githubusercontent.com/portnox/scripts/refs/heads/main/uploadportnoxdockerlogs.sh && chmod +x ./uploadportnoxdockerlogs.sh && ./uploadportnoxdockerlogs.sh"
+# Be sure to copy everything between the quotes
+# The script must be run under sudo and will error if it is not. This permission is needed to access the Docker logs
+# When prompted enter your customer (organization) name so Support can easily identify your logs
 # When prompted for the URL and token enter the full URL as provided by support
+# The URL will be long and in the following format "https://{storageaccount}.blob.core.windows.net/{container}?skoid={signed object ID}&sktid={signedTenantId}&skt={Signed Key Start}ske={Signed Key Expiry}&sks={Signed Key Service}&skv={signedKeyVersion}&sv={Signed Versio}&spr={signed protocol}&st={signed start time}&se={Signed Expiry}&sp={signed permissions}&sig={signature}"
 ########################################
 
 #!/usr/bin/env bash
