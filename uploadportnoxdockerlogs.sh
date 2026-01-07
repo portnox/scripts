@@ -1,7 +1,7 @@
 ########################################
 # The following script collects Docker logs from all Portnox containers running on the Docker host it's executed on. Those log files are then automatically uploaded to Portnox for review by support
 # The script should be executed on the Docker host running Portnox containers, such as the Local RADIUS, TACACS+, ZTNA, Unifi Agent, SiEM, etc.
-# To execute the script run the commmand in its entirety: "wget https://raw.githubusercontent.com/portnox/scripts/refs/heads/main/uploadportnoxdockerlogs.sh && chmod +x ./uploadportnoxdockerlogs.sh && ./uploadportnoxdockerlogs.sh"
+# To execute the script run the commmand in its entirety: [sudo bash -c 'curl -O https://raw.githubusercontent.com/portnox/scripts/refs/heads/main/uploadportnoxdockerlogs.sh && chmod +x ./uploadportnoxdockerlogs.sh && ./uploadportnoxdockerlogs.sh']
 # Be sure to copy everything between the quotes
 # The script must be run under sudo and will error if it is not. This permission is needed to access the Docker logs
 # When prompted enter your customer (organization) name so Support can easily identify your logs
@@ -31,6 +31,7 @@ echo "=== Collecting Portnox Docker Logs and Uploading to Azure Blob ==="
 ########################################
 command -v docker >/dev/null 2>&1 || { echo "❌ Docker is not installed"; exit 1; }
 command -v tar    >/dev/null 2>&1 || { echo "❌ tar is required"; exit 1; }
+command -v curl   >/dev/null 2>&1 || { echo "❌ curl is required"; exit 1; }
 
 ########################################
 # Prompt for customer name
@@ -80,30 +81,33 @@ tar -czf "$TGZ_FILE" "$BASE_DIR"
 
 FILE_PATH="$(pwd)/$TGZ_FILE"
 FILE_NAME=$(basename "$FILE_PATH")
-FILE_SIZE=$(stat -c%s "$FILE_PATH")
 
 ########################################
-# Build final Blob URL (ROBUST)
+# Cross-platform file size detection
 ########################################
+if stat -c%s "$FILE_PATH" >/dev/null 2>&1; then
+    FILE_SIZE=$(stat -c%s "$FILE_PATH")
+else
+    FILE_SIZE=$(stat -f%z "$FILE_PATH")
+fi
 
-# Split URL into base and query
+########################################
+# Build final Blob URL
+########################################
 BASE_URL="${FULL_BLOB_URL%%\?*}"
 QUERY_STRING=""
 if [[ "$FULL_BLOB_URL" == *"?"* ]]; then
     QUERY_STRING="?${FULL_BLOB_URL#*\?}"
 fi
 
-# Normalize multiple slashes in the path (except https://)
 NORMALIZED_BASE=$(echo "$BASE_URL" | sed -E 's#(https://[^/]+)/+#\1/#; s#//+#/#g')
-
-# Ensure exactly one slash before filename
 BLOB_URL="${NORMALIZED_BASE%/}/${FILE_NAME}${QUERY_STRING}"
 
 ########################################
-# Output curl command (debug visibility)
+# Output curl command
 ########################################
 echo
-echo "🔎 Curl command to be executed:"
+echo "🔎 Upload command to be executed:"
 echo
 echo "curl -X PUT \"${BLOB_URL}\" \\"
 echo "  -H \"x-ms-blob-type: BlockBlob\" \\"
@@ -112,7 +116,7 @@ echo "  --data-binary \"@${FILE_PATH}\""
 echo
 
 ########################################
-# Execute upload (Azure-safe handling)
+# Execute upload
 ########################################
 echo "📤 Uploading archive to Azure Blob Storage..."
 
@@ -135,9 +139,7 @@ if [[ "$HTTP_RESPONSE" == "201" ]]; then
     echo "📁 Uploaded archive: $FILE_NAME"
 
     if [[ "$CURL_EXIT_CODE" -ne 0 ]]; then
-        echo
-        echo "⚠️ Note: curl exited with code $CURL_EXIT_CODE after successful upload"
-        echo "   This is expected behavior with Azure Blob Storage."
+        echo "⚠️ curl exited with code $CURL_EXIT_CODE after successful upload (safe to ignore)"
     fi
 
     echo
@@ -154,8 +156,8 @@ fi
 ########################################
 echo
 echo "❌ Upload failed"
-echo "HTTP Status:     $HTTP_RESPONSE"
-echo "Curl Exit Code:  $CURL_EXIT_CODE"
+echo "HTTP Status: $HTTP_RESPONSE"
+echo "curl exit code: $CURL_EXIT_CODE"
 echo
 echo "Azure response:"
 cat /tmp/azure_upload_response.txt
