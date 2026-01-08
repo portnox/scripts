@@ -6,106 +6,140 @@
 # - "curl -o localradfwtest.sh https://raw.githubusercontent.com/portnox/scripts/refs/heads/main/localradfwtest.sh && chmod +x localradfwtest.sh && ./localradfwtest.sh"
 # Be sure to copy the entire command from the open quote to the close quote to make the script executable and launch the script
 ########################################
+#!/bin/sh
 
-#!/usr/bin/env bash
-set -euo pipefail
-
-########################################
+# ==============================
 # Configuration
-########################################
-BASE_PORT=443
-EXTRA_PORTS=(80 5671 5672)
+# ==============================
 
-ALL_FQDNS=(
-  "radius.portnox.com"
-  "rad-events-clear-prod-eastus.servicebus.windows.net"
-  "rad-events-clear-prod-westeu.servicebus.windows.net"
-  "devices-ingress-clear-prod-eastus.servicebus.windows.net"
-  "devices-ingress-clear-prod-westeu.servicebus.windows.net"
-  "cloudcentraalstoreprodus.blob.core.windows.net"
-  "cloudcentraalstoreprod.blob.core.windows.net"
-  "pnxeusprdclrinstallers.blob.core.windows.net"
-  "pnxweuprdclrinstallers.blob.core.windows.net"
-  "logs-consolidation-prod-eastus.servicebus.windows.net"
-  "logs-consolidation-prod-westeu.servicebus.windows.net"
-  "portnox-centraal-prod.servicebus.windows.net"
-  "portnox-centraal-prod-eastus.servicebus.windows.net"
-)
+TIMEOUT=3
+FAILED=0
 
-EXTRA_PORT_FQDNS=(
-  "portnox-centraal-prod.servicebus.windows.net"
-  "portnox-centraal-prod-eastus.servicebus.windows.net"
-)
+# Standard 443-only destinations
+DEST_443="
+radius.portnox.com
+rad-events-clear-prod-eastus.servicebus.windows.net
+rad-events-clear-prod-westeu.servicebus.windows.net
+cloudcentraalstoreprodus.blob.core.windows.net
+cloudcentraalstoreprod.blob.core.windows.net
+pnxeusprdclrinstallers.blob.core.windows.net
+pnxweuprdclrinstallers.blob.core.windows.net
+logs-consolidation-prod-eastus.servicebus.windows.net
+logs-consolidation-prod-westeu.servicebus.windows.net
+"
 
-########################################
-# DNS Resolution (Service Bus–aware)
-########################################
-resolve_all_ips() {
-  local fqdn="$1"
+# Service Bus namespaces requiring additional ports
+SERVICEBUS_MULTI_PORT="
+portnox-centraal-prod.servicebus.windows.net
+portnox-centraal-prod-eastus.servicebus.windows.net
+"
 
-  local cname
-  cname=$(dig +short CNAME "$fqdn" | sed 's/\.$//' | head -n1)
+# ==============================
+# TCP test function
+# ==============================
 
-  if [[ -n "$cname" ]]; then
-    if [[ "$cname" == *".privatelink."* ]]; then
-      cname=$(dig +short CNAME "$cname" | sed 's/\.$//' | head -n1)
-    fi
-    dig +short A "$cname"
+tcp_test() {
+  host="$1"
+  port="$2"
+
+  if command -v bash >/dev/null 2>&1; then
+    bash -c "</dev/tcp/$host/$port" >/dev/null 2>&1
+  elif command -v nc >/dev/null 2>&1; then
+    nc -w "$TIMEOUT" -z "$host" "$port" >/dev/null 2>&1
   else
-    dig +short A "$fqdn"
+    return 1
   fi
 }
 
-########################################
-# TCP Test
-########################################
-test_tcp() {
-  local ip="$1"
-  local port="$2"
+# ==============================
+# DNS resolution (portable)
+# ==============================
 
-  if timeout 3 bash -c "</dev/tcp/$ip/$port" &>/dev/null; then
-    echo "PASS"
-  else
-    echo "FAIL"
+resolve_all_names() {
+  name="$1"
+
+  # Always test the FQDN itself
+  echo "$name"
+
+  if command -v dig >/dev/null 2>&1; then
+    dig +short "$name" A
+
+  elif command -v host >/dev/null 2>&1; then
+    host "$name" | awk '/has address/ {print $4}'
+
+  elif command -v nslookup >/dev/null 2>&1; then
+    nslookup "$name" 2>/dev/null | awk '
+      /^Name:/ { seen=1; next }
+      seen && /^Address [0-9]*:/ {
+        ip=$3
+        if (ip !~ /^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)/)
+          print ip
+      }
+    '
   fi
 }
 
-########################################
-# Helper: Extra ports?
-########################################
-needs_extra_ports() {
-  local fqdn="$1"
-  for extra in "${EXTRA_PORT_FQDNS[@]}"; do
-    [[ "$fqdn" == "$extra" ]] && return 0
-  done
-  return 1
+# ==============================
+# Pretty output
+# ==============================
+
+print_result() {
+  target="$1"
+  port="$2"
+  result="$3"
+
+  printf "Testing %-60s TCP %-5s ... %s\n" "$target" "$port" "$result"
 }
 
-########################################
-# Execute Tests (Wide Output)
-########################################
-echo
+# ==============================
+# Header
+# ==============================
+
 echo "Outbound Connectivity Test"
 echo "=========================="
 echo
 
-for fqdn in "${ALL_FQDNS[@]}"; do
-  IPS=$(resolve_all_ips "$fqdn" | sort -u)
+# ==============================
+# 443-only tests
+# ==============================
 
-  for ip in $IPS; do
-    # Always test 443
-    result=$(test_tcp "$ip" "$BASE_PORT")
-    printf "Testing %-55s TCP %-5s ... %s\n" "$ip" "$BASE_PORT" "$result"
-
-    # Conditionally test extra ports
-    if needs_extra_ports "$fqdn"; then
-      for port in "${EXTRA_PORTS[@]}"; do
-        result=$(test_tcp "$ip" "$port")
-        printf "Testing %-55s TCP %-5s ... %s\n" "$ip" "$port" "$result"
-      done
+for fqdn in $DEST_443; do
+  for target in $(resolve_all_names "$fqdn"); do
+    if tcp_test "$target" 443; then
+      print_result "$target" 443 "PASS"
+    else
+      print_result "$target" 443 "FAIL"
+      FAILED=1
     fi
   done
 done
 
+# ==============================
+# Multi-port Service Bus tests
+# ==============================
+
+for fqdn in $SERVICEBUS_MULTI_PORT; do
+  for target in $(resolve_all_names "$fqdn"); do
+    for port in 443 80 5671 5672; do
+      if tcp_test "$target" "$port"; then
+        print_result "$target" "$port" "PASS"
+      else
+        print_result "$target" "$port" "FAIL"
+        FAILED=1
+      fi
+    done
+  done
+done
+
+# ==============================
+# Final result
+# ==============================
+
 echo
-echo "Connectivity test complete."
+if [ "$FAILED" -eq 0 ]; then
+  echo "RESULT: ALL CONNECTIVITY TESTS PASSED"
+  exit 0
+else
+  echo "RESULT: ONE OR MORE CONNECTIVITY TESTS FAILED"
+  exit 1
+fi
