@@ -88,6 +88,14 @@
             Runs the script continuously with the same startup parameters and renders a rolling ASCII chart of the Time metric (ms).
         -DebugOutput
             Enables detailed diagnostic logging, packet parsing, and TLS fragment dumps.
+                -Orion
+                        Emits SolarWinds SAM PowerShell Script Monitor output keys:
+                            Message.Response: <final response or error message>
+                            Statistic.ResponseTime: <elapsed milliseconds>
+                        Exit code mapping in Orion mode:
+                            0 = Access-Accept
+                            3 = Access-Reject
+                            1 = Any other failure
 
     Example invocations:
         1. PAP Authentication with regular RADIUS (no RADSEC)
@@ -181,6 +189,8 @@ param(
     [switch] $ShowHelp,
 
     [switch] $EmitResultObject,
+
+    [switch] $Orion,
 
     [switch] $DebugOutput
 )
@@ -1017,6 +1027,19 @@ function New-RadiusAttribute {
     return $attr
 }
 
+function New-RadiusIntegerAttribute {
+    param([byte] $Type, [uint32] $Value)
+
+    $bytes = [byte[]]@(
+        ([byte](($Value -shr 24) -band 0xFF)),
+        ([byte](($Value -shr 16) -band 0xFF)),
+        ([byte](($Value -shr 8) -band 0xFF)),
+        ([byte]($Value -band 0xFF))
+    )
+
+    return New-RadiusAttribute -Type $Type -Value $bytes
+}
+
 # Splits oversized attribute values into multiple TLVs of the same type.
 function New-RadiusAttributeChunks {
     param([byte] $Type,[byte[]] $Value,[int] $MaxValueLen = 253)
@@ -1151,7 +1174,7 @@ function Build-AccessRequest {
         $attrs = Concat-Bytes $attrs (New-RadiusAttribute -Type 87 -Value ([System.Text.Encoding]::UTF8.GetBytes($NasPortId)))
     }
     if ($NasPortType) {
-        $attrs = Concat-Bytes $attrs (New-RadiusAttribute -Type 61 -Value ([byte[]]@([byte][int]$NasPortType)))
+        $attrs = Concat-Bytes $attrs (New-RadiusIntegerAttribute -Type 61 -Value ([uint32][int]$NasPortType))
     }
     $attrs = Concat-Bytes $attrs ([byte[]]@(5,6,0,0,0,1))
 
@@ -1486,6 +1509,16 @@ function Get-AuthTypeSummaryLabel {
     }
 }
 
+function Get-OrionExitCode {
+    param([string] $FinalResponse)
+
+    switch ($FinalResponse) {
+        "Access-Accept" { return 0 }
+        "Access-Reject" { return 3 }
+        default { return 1 }
+    }
+}
+
 # Writes concise final run summary and optionally emits structured metrics for loop mode.
 function Write-AuthenticationSummary {
     param(
@@ -1500,7 +1533,12 @@ function Write-AuthenticationSummary {
         [long] $ElapsedMilliseconds
     )
 
-    if (-not $EmitResultObject.IsPresent) {
+    if ($Orion.IsPresent -and -not $EmitResultObject.IsPresent) {
+        Write-Host "Message.Response: $FinalResponse"
+        Write-Host ("Statistic.ResponseTime: {0}" -f [long]$ElapsedMilliseconds)
+        $script:OrionExitCode = Get-OrionExitCode -FinalResponse $FinalResponse
+        [Environment]::ExitCode = [int]$script:OrionExitCode
+    } elseif (-not $EmitResultObject.IsPresent) {
         Write-Host ""
         Write-Host "---------------------------------------------------" -ForegroundColor Cyan
         Write-Host " Authentication Summary" -ForegroundColor Cyan
@@ -1660,6 +1698,8 @@ if ($continous.IsPresent) {
     Start-ContinousMode -ScriptPath $PSCommandPath
     return
 }
+
+$script:OrionExitCode = $null
 
 if ($DebugOutput.IsPresent) {
     # Debug banner prints only when verbose tracing is explicitly requested.
@@ -2206,9 +2246,16 @@ catch {
     if ($EmitResultObject.IsPresent) {
         throw
     }
-    Write-Host ""
-    Write-Host " [ERROR] $_" -ForegroundColor Red
-    exit 1
+    if ($Orion.IsPresent) {
+        Write-Host ("Message.Response: {0}" -f $_.Exception.Message)
+        Write-Host "Statistic.ResponseTime: 0"
+        $script:OrionExitCode = 1
+        [Environment]::ExitCode = 1
+    } else {
+        Write-Host ""
+        Write-Host " [ERROR] $_" -ForegroundColor Red
+        exit 1
+    }
 }
 finally {
     if ($connection) {
@@ -2216,9 +2263,16 @@ finally {
         try { if ($connection.Tcp) { $connection.Tcp.Close() } } catch {}
         try { if ($connection.Udp) { $connection.Udp.Close() } } catch {}
     }
-    if (-not $EmitResultObject.IsPresent) {
+    if (-not $EmitResultObject.IsPresent -and -not $Orion.IsPresent) {
         Write-Host "---------------------------------------------------" -ForegroundColor Cyan
         Write-Host ""
     }
+}
+
+if ($Orion.IsPresent -and -not $EmitResultObject.IsPresent) {
+    if ($null -eq $script:OrionExitCode) {
+        $script:OrionExitCode = 1
+    }
+    exit ([int]$script:OrionExitCode)
 }
 #endregion
