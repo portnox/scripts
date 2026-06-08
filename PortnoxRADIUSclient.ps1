@@ -1,9 +1,9 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Tests RADIUS authentication using either RADSEC (RADIUS over TLS) or standard RADIUS (UDP) with PAP, PEAP/MSCHAPv2 or EAP-TLS.
+    Tests RADIUS authentication using either RADSEC (RADIUS over TLS) or standard RADIUS (UDP) with PAP, MAB, PEAP/MSCHAPv2, EAP-TLS, or EAP-TTLS/PAP.
 .DESCRIPTION
-    This script performs RADIUS authentication tests against a specified server using either standard RADIUS or RADSEC transport. It supports PAP, EAP-TLS, and PEAP/MSCHAPv2 authentication methods with flexible configuration options for EAP identities, certificates, and RADIUS attributes. The script can be used for functional testing, performance measurement, and interoperability validation of RADIUS/RADSEC deployments.
+    This script performs RADIUS authentication tests against a specified server using either standard RADIUS or RADSEC transport. It supports PAP, MAB, EAP-TLS, EAP-TTLS/PAP, and PEAP/MSCHAPv2 authentication methods with flexible configuration options for EAP identities, certificates, and RADIUS attributes. The script can be used for functional testing, performance measurement, and interoperability validation of RADIUS/RADSEC deployments.
     Parameters:
         -Server
             Target RADIUS or RADSEC server hostname or IP address.
@@ -14,11 +14,11 @@
         -UseRadSec
             Backward-compatible switch that forces RADSEC transport.
         -AuthType
-            Authentication method: PAP, EAP-TLS, or EAP-PEAP.
+            Authentication method: PAP, MAB, EAP-TLS, EAP-TTLS, or EAP-PEAP.
         -Username
-            Username used for PAP or outer/inner EAP identity defaults.
+            Username used for PAP, MAB, or outer/inner EAP identity defaults.
         -Password
-            Password used for PAP or PEAP inner EAP-MSCHAPv2.
+            Password used for PAP, MAB, TTLS tunneled PAP, or PEAP inner EAP-MSCHAPv2.
         -PeapOuterIdentity
             Optional explicit PEAP outer identity. Defaults to Username unless anonymous outer identity is requested.
         -PeapInnerIdentity
@@ -55,9 +55,9 @@
         -EapClientCertPassword
             Password for the inner EAP-TLS client certificate.
         -EapRootCACertPath
-            Root CA certificate path used to validate the inner EAP-TLS or PEAP server certificate.
+            Root CA certificate path used to validate the inner EAP-TLS, EAP-TTLS, or PEAP server certificate.
         -EapServerName
-            Expected DNS name for inner EAP-TLS or PEAP server certificate validation.
+            Expected DNS name for inner EAP-TLS, EAP-TTLS, or PEAP server certificate validation.
         -SkipEapServerCertCheck
             Disables inner EAP server certificate validation for lab or troubleshooting use.
         -SkipCertificateCheck
@@ -73,7 +73,7 @@
         -ReuseRadiusIdentifier
             Reuses the same RADIUS packet Identifier after the EAP engine is initialized.
         -MaxEapTlsFragmentSize
-            Maximum TLS payload size per outbound EAP-TLS or PEAP fragment.
+            Maximum TLS payload size per outbound EAP-TLS, EAP-TTLS, or PEAP fragment.
         -PeapPhase2VersionMode
             How PEAP phase-2 version bits are set: CopyServer, Zero, or One.
         -PeapRadiusUserNameMode
@@ -84,14 +84,20 @@
             Enables the PEAP phase-2 L-bit and length field on tunneled payloads.
         -PeapPhase2AckBeforeData
             Sends a PEAP ACK round before selected phase-2 payloads for interoperability.
-        -continous
+        -continuous
             Runs the script continuously with the same startup parameters and renders a rolling ASCII chart of the Time metric (ms).
         -DebugOutput
             Enables detailed diagnostic logging, packet parsing, and TLS fragment dumps.
                 -Orion
+                    When running under SolarWinds SAM, place Orion as the first Script
+                    Arguments token (for example: Orion,${IP},1812,RADIUS,PAP,...).
+                    The script will treat that sentinel as Orion mode and read the
+                    remaining comma-separated values into the in-script fallback settings
+                    block instead of relying on named PowerShell switch parameters.
+                    Command-line parameters still override those fallback values.
                         Emits SolarWinds SAM PowerShell Script Monitor output keys:
-                            Message.Response: <final response or error message>
-                            Statistic.ResponseTime: <elapsed milliseconds>
+                            Statistic: <elapsed milliseconds>
+                            Message: <final response or error message>
                         Exit code mapping in Orion mode:
                             0 = Access-Accept
                             3 = Access-Reject
@@ -101,8 +107,14 @@
         1. PAP Authentication with regular RADIUS (no RADSEC)
                .\PortnoxRADIUSclient.ps1 -Server {IP/FQDN} -Port {RADIUS-Port} -Transport RADIUS -SharedSecret {RADIUS secret} -AuthType PAP -Username {username} -Password {password} -NasPortId GigabitEthernet1/0/9 -NasPortType 15
 
+         1a. MAB Authentication with regular RADIUS (no RADSEC)
+             .\PortnoxRADIUSclient.ps1 -Server {IP/FQDN} -Port {RADIUS-Port} -Transport RADIUS -SharedSecret {RADIUS secret} -AuthType MAB -CallingStationId 00-11-22-33-44-55 -NasPortId GigabitEthernet1/0/9 -NasPortType 15
+
         2. PAP Authentication over RADSEC
                .\PortnoxRADIUSclient.ps1 -Server clear-rad.portnox.com -Port {RADIUS-Port} -Transport RADSEC -SharedSecret radsec -AuthType PAP -Username {username} -Password {password} -RootCACertPath .\rootCertificate.cer -NasPortId MyWiFiSSID -NasPortType 19
+
+         2a. MAB Authentication over RADSEC
+             .\PortnoxRADIUSclient.ps1 -Server clear-rad.portnox.com -Port {RADIUS-Port} -Transport RADSEC -SharedSecret radsec -AuthType MAB -CallingStationId 00-11-22-33-44-55 -RootCACertPath .\rootCertificate.cer -NasPortId MyWiFiSSID -NasPortType 19
 
         3. PEAP/MSCHAPv2 authentication with regular RADIUS (no RADSEC)
                .\PortnoxRADIUSclient.ps1 -Server {IP/FQDN} -Port {RADIUS-Port} -Transport RADIUS -SharedSecret {RADIUS secret} -AuthType EAP-PEAP -Username {username} -Password {password} -EapServerName clear-rad.portnox.com -EapRootCACertPath .\rootCertificate.cer -NasPortId GigabitEthernet1/0/9 -NasPortType 18
@@ -115,6 +127,12 @@
 
         6. EAP-TLS Authentication over RADSEC
                .\PortnoxRADIUSclient.ps1 -Server clear-rad.portnox.com -Port {RADIUS-Port} -Transport RADSEC -SharedSecret radsec -AuthType EAP-TLS -RootCACertPath .\rootCertificate.cer -EapClientCertPath .\client.p12 -EapServerName clear-rad.portnox.com -EapRootCACertPath .\rootCertificate.cer
+
+         7. EAP-TTLS/PAP Authentication with regular RADIUS (no RADSEC)
+             .\PortnoxRADIUSclient.ps1 -Server {IP/FQDN} -Port {RADIUS-Port} -Transport RADIUS -SharedSecret {RADIUS secret} -AuthType EAP-TTLS -Username {username} -Password {password} -EapServerName clear-rad.portnox.com -EapRootCACertPath .\rootCertificate.cer
+
+         8. EAP-TTLS/PAP Authentication over RADSEC
+             .\PortnoxRADIUSclient.ps1 -Server clear-rad.portnox.com -Port {RADIUS-Port} -Transport RADSEC -SharedSecret radsec -AuthType EAP-TTLS -Username {username} -Password {password} -RootCACertPath .\rootCertificate.cer -EapServerName clear-rad.portnox.com -EapRootCACertPath .\rootCertificate.cer
 
     
 #>
@@ -129,7 +147,7 @@ param(
 
     [switch] $UseRadSec,
 
-    [ValidateSet("PAP","EAP-TLS","EAP-PEAP")]
+    [ValidateSet("PAP","MAB","EAP-TLS","EAP-PEAP","EAP-TTLS")]
     [string] $AuthType = "PAP",
 
     [string] $Username,
@@ -165,7 +183,7 @@ param(
     [int] $TimeoutSeconds = 15,
     [int] $MaxEapRounds = 60,
 
-    [byte[]] $DesiredEapTypes = @([byte]13),
+    [byte[]] $DesiredEapTypes,
 
     [switch] $ReuseRadiusIdentifier,
 
@@ -183,7 +201,7 @@ param(
 
     [switch] $PeapPhase2AckBeforeData,
 
-    [switch] $continous,
+    [switch] $continuous,
 
     [Alias("?","help")]
     [switch] $ShowHelp,
@@ -195,8 +213,326 @@ param(
     [switch] $DebugOutput
 )
 
+# Populate these values only if SolarWinds SAM will invoke the script with -Orion
+# and without passing the normal script arguments. Any values passed on the command
+# line still take precedence over these in-script fallbacks.
+$script:OrionFallbackSettings = [ordered]@{
+    Server = ""
+    Port = 0
+    Transport = ""
+    UseRadSec = $false
+    AuthType = ""
+    Username = ""
+    Password = ""
+    PeapOuterIdentity = ""
+    PeapInnerIdentity = ""
+    SharedSecret = ""
+    NasIdentifier = ""
+    NasPortId = ""
+    NasPortType = ""
+    NasIpAddress = ""
+    CallingStationId = ""
+    CalledStationId = ""
+    RootCACertPath = ""
+    ClientCertPath = ""
+    ClientCertPasswordPlainText = ""
+    EapClientCertPath = ""
+    EapClientCertPasswordPlainText = ""
+    EapRootCACertPath = ""
+    EapServerName = ""
+    SkipEapServerCertCheck = $false
+    SkipCertificateCheck = $false
+    SkipRevocationCheck = $false
+    TimeoutSeconds = 0
+    MaxEapRounds = 0
+    ReuseRadiusIdentifier = $false
+    MaxEapTlsFragmentSize = 0
+    PeapPhase2VersionMode = ""
+    PeapRadiusUserNameMode = ""
+    UseAnonymousPeapOuterIdentity = $false
+    PeapPhase2SetLengthBit = $false
+    PeapPhase2AckBeforeData = $false
+    DebugOutput = $false
+}
+
+$script:IsOrionMode = $Orion.IsPresent
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+function Split-NormalizedInvocationToken {
+    param([string] $Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return @()
+    }
+
+    $tokens = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($commaPart in ($Text -split ',')) {
+        $part = $commaPart.Trim()
+        if ($part.Length -eq 0) {
+            continue
+        }
+
+        foreach ($spacePart in ($part -split '\s+(?=[A-Za-z][A-Za-z0-9]*=)')) {
+            $token = $spacePart.Trim()
+            if ($token.Length -gt 0) {
+                [void]$tokens.Add($token)
+            }
+        }
+    }
+
+    return ,$tokens.ToArray()
+}
+
+function Get-NormalizedInvocationArguments {
+    $tokens = New-Object 'System.Collections.Generic.List[string]'
+
+    $sourceArgs = @()
+    $argsVariable = Get-Variable -Name args -Scope Local -ErrorAction SilentlyContinue
+    if ($argsVariable -and $null -ne $argsVariable.Value) {
+        $sourceArgs = @($argsVariable.Value)
+    } elseif ($MyInvocation -and $MyInvocation.UnboundArguments) {
+        $sourceArgs = @($MyInvocation.UnboundArguments)
+    }
+
+    foreach ($item in $sourceArgs) {
+        if ($null -eq $item) { continue }
+        foreach ($token in (Split-NormalizedInvocationToken -Text ([string]$item))) {
+            [void]$tokens.Add($token)
+        }
+    }
+
+    return ,$tokens.ToArray()
+}
+
+function Test-IsOrionArgumentInvocation {
+    param([string[]] $InvocationArguments)
+
+    if (-not $InvocationArguments -or $InvocationArguments.Count -eq 0) {
+        return $false
+    }
+
+    if ($InvocationArguments[0] -eq 'Orion') {
+        return $true
+    }
+
+    foreach ($argument in $InvocationArguments) {
+        if ([string]::IsNullOrWhiteSpace($argument)) {
+            continue
+        }
+
+        if ($argument -match '^[A-Za-z][A-Za-z0-9]*=') {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Test-IsOrionInvocationLine {
+    param([string] $InvocationLine)
+
+    if ([string]::IsNullOrWhiteSpace($InvocationLine)) {
+        return $false
+    }
+
+    if ($InvocationLine -match '(^|[\s,])Orion([\s,]|$)') {
+        return $true
+    }
+
+    if ($InvocationLine -match '\b(Server|Port|Transport|AuthType|Username|Password|SharedSecret|NasPortId|NasPortType)=') {
+        return $true
+    }
+
+    return $false
+}
+
+function Convert-OrionArgumentValue {
+    param([string] $Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $null
+    }
+
+    $trimmed = $Value.Trim()
+    switch -Regex ($trimmed) {
+        '^(?i:true|false)$' { return [bool]::Parse($trimmed) }
+        '^(?i:1|0|yes|no|on|off)$' {
+            switch -Regex ($trimmed) {
+                '^(?i:1|yes|on)$' { return $true }
+                default { return $false }
+            }
+        }
+        '^(?i:null|none)$' { return $null }
+        '^[+-]?\d+$' {
+            try { return [int]$trimmed } catch { return $trimmed }
+        }
+        default { return $trimmed }
+    }
+}
+
+function Initialize-OrionFallbackSettingsFromArguments {
+    param([string[]] $InvocationArguments)
+
+    if (-not $InvocationArguments -or $InvocationArguments.Count -eq 0) {
+        return $false
+    }
+
+    if ($InvocationArguments[0] -ne 'Orion') {
+        return $false
+    }
+
+    $script:IsOrionMode = $true
+
+    $orionArgumentNames = @(
+        'Server',
+        'Port',
+        'Transport',
+        'UseRadSec',
+        'AuthType',
+        'Username',
+        'Password',
+        'PeapOuterIdentity',
+        'PeapInnerIdentity',
+        'SharedSecret',
+        'NasIdentifier',
+        'NasPortId',
+        'NasPortType',
+        'NasIpAddress',
+        'CallingStationId',
+        'CalledStationId',
+        'RootCACertPath',
+        'ClientCertPath',
+        'ClientCertPasswordPlainText',
+        'EapClientCertPath',
+        'EapClientCertPasswordPlainText',
+        'EapRootCACertPath',
+        'EapServerName',
+        'SkipEapServerCertCheck',
+        'SkipCertificateCheck',
+        'SkipRevocationCheck',
+        'TimeoutSeconds',
+        'MaxEapRounds',
+        'ReuseRadiusIdentifier',
+        'MaxEapTlsFragmentSize',
+        'PeapPhase2VersionMode',
+        'PeapRadiusUserNameMode',
+        'UseAnonymousPeapOuterIdentity',
+        'PeapPhase2SetLengthBit',
+        'PeapPhase2AckBeforeData',
+        'DebugOutput'
+    )
+
+    $positionalIndex = 0
+    for ($i = 1; $i -lt $InvocationArguments.Count; $i++) {
+        $argument = $InvocationArguments[$i]
+        if ([string]::IsNullOrWhiteSpace($argument)) {
+            continue
+        }
+
+        $name = $null
+        $valueText = $argument
+        if ($argument -match '^([^=]+)=(.*)$') {
+            $candidateName = $matches[1].Trim()
+            if ($candidateName) {
+                $name = $candidateName
+                $valueText = $matches[2]
+            }
+        }
+
+        if (-not $name) {
+            if ($positionalIndex -ge $orionArgumentNames.Count) {
+                continue
+            }
+            $name = $orionArgumentNames[$positionalIndex]
+            $positionalIndex++
+        }
+
+        $value = Convert-OrionArgumentValue -Value $valueText
+        if ($null -eq $value) {
+            continue
+        }
+
+        switch ($name) {
+            'UseRadSec' { $script:OrionFallbackSettings.UseRadSec = [bool]$value; continue }
+            'SkipEapServerCertCheck' { $script:OrionFallbackSettings.SkipEapServerCertCheck = [bool]$value; continue }
+            'SkipCertificateCheck' { $script:OrionFallbackSettings.SkipCertificateCheck = [bool]$value; continue }
+            'SkipRevocationCheck' { $script:OrionFallbackSettings.SkipRevocationCheck = [bool]$value; continue }
+            'ReuseRadiusIdentifier' { $script:OrionFallbackSettings.ReuseRadiusIdentifier = [bool]$value; continue }
+            'UseAnonymousPeapOuterIdentity' { $script:OrionFallbackSettings.UseAnonymousPeapOuterIdentity = [bool]$value; continue }
+            'PeapPhase2SetLengthBit' { $script:OrionFallbackSettings.PeapPhase2SetLengthBit = [bool]$value; continue }
+            'PeapPhase2AckBeforeData' { $script:OrionFallbackSettings.PeapPhase2AckBeforeData = [bool]$value; continue }
+            'DebugOutput' { $script:OrionFallbackSettings.DebugOutput = [bool]$value; continue }
+            'Port' { $script:OrionFallbackSettings.Port = [int]$value; continue }
+            'TimeoutSeconds' { $script:OrionFallbackSettings.TimeoutSeconds = [int]$value; continue }
+            'MaxEapRounds' { $script:OrionFallbackSettings.MaxEapRounds = [int]$value; continue }
+            'MaxEapTlsFragmentSize' { $script:OrionFallbackSettings.MaxEapTlsFragmentSize = [int]$value; continue }
+            'ClientCertPasswordPlainText' { $script:OrionFallbackSettings.ClientCertPasswordPlainText = [string]$value; continue }
+            'EapClientCertPasswordPlainText' { $script:OrionFallbackSettings.EapClientCertPasswordPlainText = [string]$value; continue }
+            default { $script:OrionFallbackSettings[$name] = [string]$value }
+        }
+    }
+
+    return $true
+}
+
+function Apply-OrionFallbackSettings {
+    param([System.Collections.IDictionary] $BoundParameters)
+
+    if (-not $script:IsOrionMode) {
+        return
+    }
+
+    foreach ($entry in $script:OrionFallbackSettings.GetEnumerator()) {
+        $name = [string]$entry.Key
+        $value = $entry.Value
+
+        if ($name -in @("ClientCertPasswordPlainText", "EapClientCertPasswordPlainText")) {
+            continue
+        }
+
+        if ($BoundParameters.ContainsKey($name) -and -not ($script:IsOrionMode -and $name -eq "Server" -and $Server -match '(^|[\s,])Orion([\s,]|$)')) {
+            continue
+        }
+
+        if ($value -is [string]) {
+            if ([string]::IsNullOrWhiteSpace($value)) {
+                continue
+            }
+            Set-Variable -Name $name -Value $value -Scope Script
+            continue
+        }
+
+        if ($value -is [int]) {
+            if ($value -le 0) {
+                continue
+            }
+            Set-Variable -Name $name -Value $value -Scope Script
+            continue
+        }
+
+        if ($value -is [bool]) {
+            if (-not $value) {
+                continue
+            }
+            Set-Variable -Name $name -Value ([System.Management.Automation.SwitchParameter]::Present) -Scope Script
+            continue
+        }
+
+        if ($null -ne $value) {
+            Set-Variable -Name $name -Value $value -Scope Script
+        }
+    }
+
+    if (-not $BoundParameters.ContainsKey("ClientCertPassword") -and -not [string]::IsNullOrWhiteSpace($script:OrionFallbackSettings.ClientCertPasswordPlainText)) {
+        $ClientCertPassword = ConvertTo-SecureString -String $script:OrionFallbackSettings.ClientCertPasswordPlainText -AsPlainText -Force
+    }
+
+    if (-not $BoundParameters.ContainsKey("EapClientCertPassword") -and -not [string]::IsNullOrWhiteSpace($script:OrionFallbackSettings.EapClientCertPasswordPlainText)) {
+        $EapClientCertPassword = ConvertTo-SecureString -String $script:OrionFallbackSettings.EapClientCertPasswordPlainText -AsPlainText -Force
+    }
+}
 
 # Reads the top <# ... #> block from this script and prints it as runtime help.
 # This keeps CLI help aligned with the maintained header documentation.
@@ -235,7 +571,18 @@ function Write-ScriptHeaderHelp {
     Write-Host "No script header help block was found."
 }
 
-$rawArgs = @($args | ForEach-Object { [string]$_ })
+$rawArgs = Get-NormalizedInvocationArguments
+if ($Server -and $Server -match '(^|[\s,])Orion([\s,]|$)') {
+    $serverArgTokens = Split-NormalizedInvocationToken -Text $Server
+    if ($serverArgTokens -and $serverArgTokens.Count -gt 0) {
+        $rawArgs = @($serverArgTokens) + @($rawArgs)
+    } elseif (-not $rawArgs -or $rawArgs.Count -eq 0 -or $rawArgs[0] -ne "Orion") {
+        $rawArgs = @("Orion") + @($rawArgs)
+    }
+}
+$script:IsOrionMode = $script:IsOrionMode -or (Test-IsOrionArgumentInvocation -InvocationArguments $rawArgs)
+$script:IsOrionMode = $script:IsOrionMode -or (Test-IsOrionInvocationLine -InvocationLine $MyInvocation.Line)
+$null = Initialize-OrionFallbackSettingsFromArguments -InvocationArguments $rawArgs
 $helpTokenRequested = $rawArgs -contains "/?" -or $rawArgs -contains "-?" -or $rawArgs -contains "-help" -or $rawArgs -contains "--help"
 $noArgumentsProvided = ($PSBoundParameters.Count -eq 0 -and $rawArgs.Count -eq 0)
 
@@ -244,6 +591,8 @@ if ($ShowHelp.IsPresent -or $helpTokenRequested -or $noArgumentsProvided) {
     Write-ScriptHeaderHelp -Path $PSCommandPath
     return
 }
+
+Apply-OrionFallbackSettings -BoundParameters $PSBoundParameters
 
 if ([string]::IsNullOrWhiteSpace($Server)) {
     throw "Parameter -Server is required. Run the script with -help to view parameters and examples."
@@ -277,9 +626,14 @@ if ($UseRadSec.IsPresent) {
 if ($AuthType -eq "PAP") {
     if (-not $Username) { throw "Parameter -Username is required for PAP." }
     if (-not $Password) { throw "Parameter -Password is required for PAP." }
+} elseif ($AuthType -eq "MAB") {
+    if (-not $Username) { $Username = $CallingStationId }
+    if (-not $Password) { $Password = $Username }
+    if (-not $Username) { throw "Parameter -Username or -CallingStationId is required for MAB." }
 } else {
     if (-not $Username) { $Username = "eapuser" }
     if ($AuthType -eq "EAP-PEAP" -and -not $Password) { throw "Parameter -Password is required for EAP-PEAP (MSCHAPv2 inner auth)." }
+    if ($AuthType -eq "EAP-TTLS" -and -not $Password) { throw "Parameter -Password is required for EAP-TTLS (tunneled PAP auth)." }
     if (-not $EapClientCertPath) { $EapClientCertPath = $ClientCertPath }
     if (-not $EapClientCertPassword) { $EapClientCertPassword = $ClientCertPassword }
     if (-not $EapRootCACertPath) { $EapRootCACertPath = $RootCACertPath }
@@ -324,6 +678,15 @@ if ($AuthType -eq "EAP-PEAP" -and -not $PSBoundParameters.ContainsKey("PeapPhase
     # Interop default: after generating tunneled phase-2 data, send one PEAP ACK first and
     # send the tunneled payload on the next PEAP round.
     $PeapPhase2AckBeforeData = $true
+}
+
+if (-not $PSBoundParameters.ContainsKey("DesiredEapTypes") -or -not $DesiredEapTypes -or $DesiredEapTypes.Length -eq 0) {
+    # Default NAK suggestions should align with the selected auth method.
+    $DesiredEapTypes = switch ($AuthType) {
+        "EAP-TTLS" { @([byte]21) }
+        "EAP-PEAP" { @([byte]25) }
+        default { @([byte]13) }
+    }
 }
 #endregion
 
@@ -373,6 +736,7 @@ $EapTypeName = @{
     2  = "Notification"
     3  = "NAK"
     13 = "EAP-TLS"
+    21 = "EAP-TTLS"
     25 = "PEAP"
     26 = "EAP-MSCHAPv2"
 }
@@ -915,6 +1279,47 @@ function Take-PipeOutgoingBurst {
     return $all
 }
 
+# Creates TTLS AVPs carrying tunneled PAP credentials.
+function New-TtlsPhase2PapPayload {
+    param(
+        [string] $Username,
+        [string] $Password
+    )
+
+    function New-TtlsAvp {
+        param([uint32] $Code, [byte[]] $Data)
+
+        if (-not $Data) { $Data = [byte[]]::new(0) }
+        $headerLen = 8
+        $totalLen = $headerLen + $Data.Length
+        $paddedLen = [int]([Math]::Ceiling($totalLen / 4.0) * 4)
+        $avp = [byte[]]::new($paddedLen)
+
+        $avp[0] = [byte](($Code -shr 24) -band 0xFF)
+        $avp[1] = [byte](($Code -shr 16) -band 0xFF)
+        $avp[2] = [byte](($Code -shr 8) -band 0xFF)
+        $avp[3] = [byte]($Code -band 0xFF)
+        $avp[4] = 0x40 # Mandatory bit
+        $avp[5] = [byte](($totalLen -shr 16) -band 0xFF)
+        $avp[6] = [byte](($totalLen -shr 8) -band 0xFF)
+        $avp[7] = [byte]($totalLen -band 0xFF)
+
+        if ($Data.Length -gt 0) {
+            [Array]::Copy($Data, 0, $avp, $headerLen, $Data.Length)
+        }
+
+        return $avp
+    }
+
+    $userBytes = [System.Text.Encoding]::UTF8.GetBytes($Username)
+    $passBytes = [System.Text.Encoding]::UTF8.GetBytes($Password)
+
+    $userAvp = New-TtlsAvp -Code 1 -Data $userBytes
+    $passAvp = New-TtlsAvp -Code 2 -Data $passBytes
+
+    return Concat-Bytes $userAvp $passAvp
+}
+
 # Implements PEAP inner state machine responses (Identity, MSCHAPv2 challenge/success, Type 33).
 function New-PeapInnerResponse {
     param(
@@ -1154,12 +1559,12 @@ function Protect-UserPassword {
     return $cipher
 }
 
-# Builds a complete Access-Request for PAP or EAP, including optional NAS port attributes.
+# Builds a complete Access-Request for PAP, MAB, or EAP, including optional NAS port attributes.
 function Build-AccessRequest {
     param(
         [string] $Username,[string] $Password,[string] $SharedSecret,
         [string] $NasIdentifier,[string] $NasPortId,[string] $NasPortType,[string] $NasIpAddress,[string] $CallingStationId,[string] $CalledStationId,
-        [byte] $Identifier,[ValidateSet("PAP","EAP-TLS","EAP-PEAP")] [string] $AuthType,
+        [byte] $Identifier,[ValidateSet("PAP","MAB","EAP-TLS","EAP-PEAP","EAP-TTLS")] [string] $AuthType,
         [byte[]] $EapMessage,[byte[]] $State
     )
 
@@ -1181,7 +1586,7 @@ function Build-AccessRequest {
     if ($CallingStationId) { $attrs = Concat-Bytes $attrs (New-RadiusAttribute -Type 31 -Value ([System.Text.Encoding]::UTF8.GetBytes($CallingStationId))) }
     if ($CalledStationId)  { $attrs = Concat-Bytes $attrs (New-RadiusAttribute -Type 30 -Value ([System.Text.Encoding]::UTF8.GetBytes($CalledStationId))) }
 
-    if ($AuthType -eq "PAP") {
+    if ($AuthType -eq "PAP" -or $AuthType -eq "MAB") {
         $cipher = Protect-UserPassword -PlainPassword $Password -Secret $SharedSecret -RequestAuthenticator $auth
         $attrs = Concat-Bytes $attrs (New-RadiusAttribute -Type 2 -Value $cipher)
         $maOffset = $null
@@ -1200,7 +1605,7 @@ function Build-AccessRequest {
     [Array]::Copy($auth,0,$header,4,16)
 
     $packet = Concat-Bytes $header $attrs
-    if ($AuthType -ne "PAP") {
+    if ($AuthType -ne "PAP" -and $AuthType -ne "MAB") {
         $packet = Sign-MessageAuthenticator -Packet $packet -MaOffsetInAttrs $maOffset -SharedSecret $SharedSecret
     }
     return $packet
@@ -1415,7 +1820,7 @@ function Read-RadiusResponsePacket {
 #endregion
 
 #region --- Inner EAP-TLS engine using SslStream over pipe
-# Creates the inner TLS engine used by both EAP-TLS and PEAP outer method.
+# Creates the inner TLS engine used by EAP-TLS, EAP-TTLS, and PEAP outer methods.
 function New-EapTlsEngine {
     param(
         [string] $ServerName,
@@ -1504,7 +1909,9 @@ $timeoutMs = $TimeoutSeconds * 1000
 function Get-AuthTypeSummaryLabel {
     param([string]$Type)
     switch ($Type) {
+        "MAB" { return "MAB" }
         "EAP-PEAP" { return "PEAP/MSCHAPv2" }
+        "EAP-TTLS" { return "EAP-TTLS/PAP" }
         default { return $Type }
     }
 }
@@ -1533,9 +1940,9 @@ function Write-AuthenticationSummary {
         [long] $ElapsedMilliseconds
     )
 
-    if ($Orion.IsPresent -and -not $EmitResultObject.IsPresent) {
-        Write-Host "Message.Response: $FinalResponse"
-        Write-Host ("Statistic.ResponseTime: {0}" -f [long]$ElapsedMilliseconds)
+    if ($script:IsOrionMode -and -not $EmitResultObject.IsPresent) {
+        echo ("Statistic: {0}" -f [long]$ElapsedMilliseconds)
+        echo ("Message: {0}" -f $FinalResponse)
         $script:OrionExitCode = Get-OrionExitCode -FinalResponse $FinalResponse
         [Environment]::ExitCode = [int]$script:OrionExitCode
     } elseif (-not $EmitResultObject.IsPresent) {
@@ -1551,6 +1958,10 @@ function Write-AuthenticationSummary {
         Write-Host " Secret    : $SharedSecret"
         Write-Host " Response  : $FinalResponse"
         Write-Host " Time      : $ElapsedMilliseconds ms"
+        echo ("Statistic: {0}" -f [long]$ElapsedMilliseconds)
+        echo ("Message: {0}" -f $FinalResponse)
+        $script:OrionExitCode = Get-OrionExitCode -FinalResponse $FinalResponse
+        [Environment]::ExitCode = [int]$script:OrionExitCode
     }
 
     if ($EmitResultObject.IsPresent) {
@@ -1642,7 +2053,7 @@ function Write-TimeSeriesAsciiChart {
 }
 
 # Replays the same startup parameters repeatedly and refreshes the timing chart in-place.
-function Start-ContinousMode {
+function Start-ContinuousMode {
     param([string] $ScriptPath)
 
     if (-not $ScriptPath -or -not (Test-Path -LiteralPath $ScriptPath)) {
@@ -1651,7 +2062,7 @@ function Start-ContinousMode {
 
     $childParams = @{}
     foreach ($entry in $script:StartupBoundParameters.GetEnumerator()) {
-        if ($entry.Key -in @("continous","ShowHelp","EmitResultObject")) { continue }
+        if ($entry.Key -in @("continuous","ShowHelp","EmitResultObject")) { continue }
         $childParams[$entry.Key] = $entry.Value
     }
     $childParams["EmitResultObject"] = $true
@@ -1693,9 +2104,9 @@ function Start-ContinousMode {
     }
 }
 
-if ($continous.IsPresent) {
+if ($continuous.IsPresent) {
     # Continuous mode wraps this script as a child process and renders a live timing chart.
-    Start-ContinousMode -ScriptPath $PSCommandPath
+    Start-ContinuousMode -ScriptPath $PSCommandPath
     return
 }
 
@@ -1716,6 +2127,13 @@ if ($DebugOutput.IsPresent) {
         Write-Host " PEAP In   : $PeapInnerIdentity"
         Write-Host " PEAP R-U  : $PeapRadiusUserNameMode"
     }
+    if ($DesiredEapTypes -and $DesiredEapTypes.Length -gt 0) {
+        $desiredTypeLabels = @($DesiredEapTypes | ForEach-Object {
+            $t = [int][byte]$_
+            "{0}({1})" -f $t, (Get-EapTypeName $t)
+        }) -join ", "
+        Write-Host " NAK Types : $desiredTypeLabels"
+    }
     Write-Host " NAS-ID    : $NasIdentifier"
     Write-Host " Secret    : $SharedSecret"
     Write-Host ""
@@ -1734,12 +2152,12 @@ try {
         $connection = New-RadiusUdpConnection -Server $Server -Port $Port -TimeoutMs $timeoutMs
     }
 
-    # PAP is a single request/response exchange and returns immediately after summary output.
-    if ($AuthType -eq "PAP") {
+    # PAP and MAB are single request/response exchanges and return immediately after summary output.
+    if ($AuthType -eq "PAP" -or $AuthType -eq "MAB") {
         $rid = [byte](Get-Random -Minimum 0 -Maximum 255)
         $req = Build-AccessRequest -Username $Username -Password $Password -SharedSecret $SharedSecret `
             -NasIdentifier $NasIdentifier -NasPortId $NasPortId -NasPortType $NasPortType -NasIpAddress $NasIpAddress -CallingStationId $CallingStationId -CalledStationId $CalledStationId `
-            -Identifier $rid -AuthType "PAP"
+            -Identifier $rid -AuthType $AuthType
         Send-RadiusRequestPacket -Connection $connection -Packet $req -TransportMode $Transport
         $resp = Parse-RadiusResponse -Data (Read-RadiusResponsePacket -Connection $connection -TimeoutMs $timeoutMs -Diag $DebugOutput.IsPresent -TransportMode $Transport) -Diag $DebugOutput.IsPresent
         $stopwatch.Stop()
@@ -1751,16 +2169,24 @@ try {
     $engine = $null
     $pipe = $null
     $tlsTask = $null
-    $outerEapType = if ($AuthType -eq "EAP-PEAP") { [byte]25 } else { [byte]13 }
+    $outerEapType = switch ($AuthType) {
+        "EAP-PEAP" { [byte]25 }
+        "EAP-TTLS" { [byte]21 }
+        default { [byte]13 }
+    }
     $outerEapName = Get-EapTypeName $outerEapType
     if ($AuthType -eq "EAP-PEAP" -and $DebugOutput.IsPresent) {
         Write-Host " [INFO] EAP-PEAP outer tunnel enabled with Phase 2 inner EAP-MSCHAPv2 support." -ForegroundColor Yellow
         Write-Host (" [INFO] PEAP Phase2 compat: VersionMode={0}, LengthBit={1}, AckBeforeData={2}" -f $PeapPhase2VersionMode, $PeapPhase2SetLengthBit.IsPresent, $PeapPhase2AckBeforeData.IsPresent) -ForegroundColor Yellow
     }
+    if ($AuthType -eq "EAP-TTLS" -and $DebugOutput.IsPresent) {
+        Write-Host " [INFO] EAP-TTLS outer tunnel enabled with Phase 2 tunneled PAP support." -ForegroundColor Yellow
+    }
     $peapInnerComplete = $false
     $peapInnerWaitRounds = 0
     $peapLastServerVersionBits = [byte]0
     $peapDeferredOuterPacket = $null
+    $ttlsPhase2Complete = $false
     $script:PeapInnerReadTask = $null
     $script:PeapInnerReadBuffer = $null
 
@@ -1875,7 +2301,7 @@ try {
         }
 
         if ($eapParsed.Type -eq $outerEapType) {
-            # Outer EAP-TLS/PEAP handling drives fragment ACK logic and inner TLS engine progression.
+            # Outer EAP-TLS/TTLS/PEAP handling drives fragment ACK logic and inner TLS engine progression.
             $td = Parse-EapTlsTypeData -TypeData $eapParsed.Data
             if ($outerEapType -eq 25) {
                 $peapLastServerVersionBits = [byte]($td.Flags -band 0x07)
@@ -2224,6 +2650,60 @@ try {
                             $nextEap = New-EapTlsAckResponse -Id $eapId -OuterType $outerEapType
                             continue
                         }
+                        if ($AuthType -eq "EAP-TTLS") {
+                            if (-not $ttlsPhase2Complete) {
+                                $ttlsPayload = New-TtlsPhase2PapPayload -Username $innerEapIdentity -Password $Password
+                                if ($DebugOutput.IsPresent) {
+                                    $ttlsUserLen = [System.Text.Encoding]::UTF8.GetByteCount($innerEapIdentity)
+                                    $ttlsPassLen = [System.Text.Encoding]::UTF8.GetByteCount($Password)
+                                    Write-Host (" [DBG] TTLS phase2 AVPs: User-Name({0} bytes), User-Password({1} bytes), TotalPayload={2} bytes" -f $ttlsUserLen, $ttlsPassLen, $ttlsPayload.Length) -ForegroundColor DarkGray
+                                    Write-Host (" [DBG] TTLS phase2 payload hex: {0}" -f (Bytes-ToHex $ttlsPayload)) -ForegroundColor DarkGray
+                                }
+
+                                $engine.Ssl.Write($ttlsPayload, 0, $ttlsPayload.Length)
+                                $engine.Ssl.Flush()
+
+                                $ttlsOut = Take-PipeOutgoingBurst -Pipe $pipe -FirstWaitMs 2000 -NextWaitMs 60 -MaxExtraReads 30
+                                if ($ttlsOut.Length -eq 0) {
+                                    throw "EAP-TTLS phase2 PAP payload was written, but no outer TLS data became available to send."
+                                }
+
+                                $clientOut = Concat-Bytes $clientOut $ttlsOut
+                                if ($clientOut.Length -eq $ttlsOut.Length) {
+                                    $clientOutTotal = [uint32]$ttlsOut.Length
+                                    $lenFieldSent = $false
+                                } elseif ($null -eq $clientOutTotal) {
+                                    $clientOutTotal = [uint32]$clientOut.Length
+                                }
+
+                                $take = [Math]::Min($MaxEapTlsFragmentSize, $clientOut.Length)
+                                $frag = [byte[]]::new($take)
+                                [Array]::Copy($clientOut, 0, $frag, 0, $take)
+
+                                $remain = $clientOut.Length - $take
+                                $rest = [byte[]]::new($remain)
+                                if ($remain -gt 0) { [Array]::Copy($clientOut, $take, $rest, 0, $remain) }
+                                $clientOut = $rest
+
+                                # TTLS phase 2 payloads are sent without L-bit/length by default.
+                                $flags = 0
+                                if ($clientOut.Length -gt 0) { $flags = $flags -bor 0x40 }
+
+                                if ($DebugOutput.IsPresent) {
+                                    Write-Host (" [DBG] EAP-TTLS out: send={0} remain={1} flags=0x{2}" -f $frag.Length, $clientOut.Length, ([byte]$flags).ToString("X2")) -ForegroundColor DarkGray
+                                }
+
+                                $ttlsPhase2Complete = $true
+                                $nextEap = New-EapTlsResponse -Id $eapId -Flags ([byte]$flags) -TlsPayload $frag -TotalLen $null -OuterType $outerEapType
+                                continue
+                            }
+
+                            if ($DebugOutput.IsPresent) {
+                                Write-Host " [DBG] TTLS phase2 payload sent; replying with ACK while waiting for outer Access-Accept/Reject." -ForegroundColor DarkGray
+                            }
+                            $nextEap = New-EapTlsAckResponse -Id $eapId -OuterType $outerEapType
+                            continue
+                        }
                         # Handshake complete - send empty ACK to finalize
                         if ($DebugOutput.IsPresent) {
                             Write-Host (" [DBG] {0} handshake complete. Sending empty ACK..." -f $outerEapName) -ForegroundColor DarkGray
@@ -2246,14 +2726,16 @@ catch {
     if ($EmitResultObject.IsPresent) {
         throw
     }
-    if ($Orion.IsPresent) {
-        Write-Host ("Message.Response: {0}" -f $_.Exception.Message)
-        Write-Host "Statistic.ResponseTime: 0"
+    if ($script:IsOrionMode) {
+        echo "Statistic: 0"
+        echo ("Message: {0}" -f $_.Exception.Message)
         $script:OrionExitCode = 1
         [Environment]::ExitCode = 1
     } else {
         Write-Host ""
         Write-Host " [ERROR] $_" -ForegroundColor Red
+        echo "Statistic: 0"
+        echo ("Message: {0}" -f $_.Exception.Message)
         exit 1
     }
 }
@@ -2263,13 +2745,13 @@ finally {
         try { if ($connection.Tcp) { $connection.Tcp.Close() } } catch {}
         try { if ($connection.Udp) { $connection.Udp.Close() } } catch {}
     }
-    if (-not $EmitResultObject.IsPresent -and -not $Orion.IsPresent) {
+    if (-not $EmitResultObject.IsPresent -and -not $script:IsOrionMode) {
         Write-Host "---------------------------------------------------" -ForegroundColor Cyan
         Write-Host ""
     }
 }
 
-if ($Orion.IsPresent -and -not $EmitResultObject.IsPresent) {
+if ($script:IsOrionMode -and -not $EmitResultObject.IsPresent) {
     if ($null -eq $script:OrionExitCode) {
         $script:OrionExitCode = 1
     }
