@@ -65,7 +65,13 @@
         -SkipRevocationCheck
             Disables certificate revocation checking for outer RADSEC validation.
         -TimeoutSeconds
-            Per-request timeout in seconds for network and EAP round processing.
+            Per-request timeout in seconds for network and EAP round processing. For UDP RADIUS
+            (Transport RADIUS), each round automatically retransmits the same request up to 2
+            additional times on timeout before failing, so a worst-case timed-out round can take
+            up to 3x this value. For RADSEC (Transport RADSEC), the initial TCP connect + TLS
+            handshake similarly retries up to 2 additional times (with a fresh connection each
+            attempt) before failing, to absorb transient connection blips or brief certificate
+            revocation-check (OCSP/CRL) lookup timeouts.
         -MaxEapRounds
             Maximum number of EAP rounds before aborting.
         -DesiredEapTypes
@@ -88,6 +94,16 @@
             Runs the script continuously with the same startup parameters and renders a rolling ASCII chart of the Time metric (ms).
         -DebugOutput
             Enables detailed diagnostic logging, packet parsing, and TLS fragment dumps.
+        -CaptureDebugOnFailure
+            Forces full diagnostic verbosity (as if -DebugOutput were set) into a PowerShell
+            transcript for this run. The transcript is discarded automatically when the run
+            ends in Access-Accept, and kept only when it ends in reject/failure/error - safe to
+            leave enabled permanently on Orion/SAM monitors without generating noise on
+            successful runs. Combine with -DebugLogDirectory to control where failure logs land,
+            e.g. in the Orion Script Arguments: ...,CaptureDebugOnFailure=1,DebugLogDirectory=C:\ProgramData\PortnoxRadiusDebug
+        -DebugLogDirectory
+            Directory where failure transcripts are written when -CaptureDebugOnFailure is used.
+            Defaults to a "PortnoxRadiusDebugLogs" folder under the system temp directory.
                 -Orion
                     When running under SolarWinds SAM, place Orion as the first Script
                     Arguments token (for example: Orion,${IP},1812,RADIUS,PAP,...).
@@ -137,7 +153,7 @@
     
 #>
 
-[CmdletBinding()]
+[CmdletBinding(PositionalBinding=$false)]
 param(
     [string] $Server,
     [int] $Port = 0,
@@ -210,7 +226,31 @@ param(
 
     [switch] $Orion,
 
-    [switch] $DebugOutput
+    [switch] $DebugOutput,
+
+    # Intentionally [string] rather than [switch]/[bool]: SolarWinds SAM decomposes
+    # comma-separated "Name=Value" Script Arguments into individually PSRP-bound named
+    # parameters, passing an explicit System.String value (e.g. "1") for
+    # CaptureDebugOnFailure=1. PowerShell's ArgumentTypeConverterAttribute (auto-applied to
+    # [switch] AND [bool] parameters) explicitly rejects any System.String value in that
+    # binding path - even "1" - accepting only real Boolean/SwitchParameter/numeric CLR types
+    # ("Cannot convert value "System.String" to type ... Boolean/SwitchParameter"). [string]
+    # has no such converter, so PSRP binding always succeeds; truthiness is evaluated manually
+    # via Test-TruthyToken below.
+    [string] $CaptureDebugOnFailure = "",
+    [string] $DebugLogDirectory = (Join-Path ([System.IO.Path]::GetTempPath()) "PortnoxRadiusDebugLogs"),
+
+    # Catches any stray unnamed/positional argument - most notably the bare "Orion" sentinel
+    # token in comma-separated SAM Script Arguments - that isn't consumed by any named
+    # parameter above. With PositionalBinding=$false, PowerShell has no other eligible
+    # parameter to place an unnamed value into; advanced functions/scripts ([CmdletBinding()])
+    # have no implicit $args catch-all, so without this the binder hard-fails with
+    # "A positional parameter cannot be found that accepts argument 'Orion'." instead of
+    # either silently corrupting some other parameter (the original bug) or accepting it
+    # harmlessly. Must remain the last declared parameter (ValueFromRemainingArguments
+    # requirement).
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]] $RemainingArguments
 )
 
 # Populate these values only if SolarWinds SAM will invoke the script with -Orion
@@ -253,6 +293,8 @@ $script:OrionFallbackSettings = [ordered]@{
     PeapPhase2SetLengthBit = $false
     PeapPhase2AckBeforeData = $false
     DebugOutput = $false
+    CaptureDebugOnFailure = $false
+    DebugLogDirectory = ""
 }
 
 $script:IsOrionMode = $Orion.IsPresent
@@ -260,13 +302,21 @@ $script:IsOrionMode = $Orion.IsPresent
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+# Manually interprets a raw string value (from -CaptureDebugOnFailure or similar
+# string-typed flag parameters) as a boolean, since these parameters are intentionally
+# NOT [switch]/[bool] typed - see the -CaptureDebugOnFailure param block comment for why.
+function Test-TruthyToken {
+    param([string] $Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    return ($Value.Trim() -notmatch '(?i)^(0|false|no|off)$')
+}
+
 function Split-NormalizedInvocationToken {
     param([string] $Text)
 
     if ([string]::IsNullOrWhiteSpace($Text)) {
         return @()
     }
-
     $tokens = New-Object 'System.Collections.Generic.List[string]'
     foreach ($commaPart in ($Text -split ',')) {
         $part = $commaPart.Trim()
@@ -288,12 +338,19 @@ function Split-NormalizedInvocationToken {
 function Get-NormalizedInvocationArguments {
     $tokens = New-Object 'System.Collections.Generic.List[string]'
 
+    # With PositionalBinding=$false, any stray unnamed argument (e.g. the bare "Orion" sentinel
+    # token) is captured by the -RemainingArguments catch-all parameter rather than surfacing in
+    # $args or $MyInvocation.UnboundArguments, so check it first.
     $sourceArgs = @()
-    $argsVariable = Get-Variable -Name args -Scope Local -ErrorAction SilentlyContinue
-    if ($argsVariable -and $null -ne $argsVariable.Value) {
-        $sourceArgs = @($argsVariable.Value)
-    } elseif ($MyInvocation -and $MyInvocation.UnboundArguments) {
-        $sourceArgs = @($MyInvocation.UnboundArguments)
+    if ($RemainingArguments -and $RemainingArguments.Count -gt 0) {
+        $sourceArgs = @($RemainingArguments)
+    } else {
+        $argsVariable = Get-Variable -Name args -Scope Local -ErrorAction SilentlyContinue
+        if ($argsVariable -and $null -ne $argsVariable.Value) {
+            $sourceArgs = @($argsVariable.Value)
+        } elseif ($MyInvocation -and $MyInvocation.UnboundArguments) {
+            $sourceArgs = @($MyInvocation.UnboundArguments)
+        }
     }
 
     foreach ($item in $sourceArgs) {
@@ -341,7 +398,7 @@ function Test-IsOrionInvocationLine {
         return $true
     }
 
-    if ($InvocationLine -match '\b(Server|Port|Transport|AuthType|Username|Password|SharedSecret|NasPortId|NasPortType)=') {
+    if ($InvocationLine -match '\b(Server|Port|Transport|AuthType|Username|Password|SharedSecret|NasPortId|NasPortType|CaptureDebugOnFailure|DebugLogDirectory)=') {
         return $true
     }
 
@@ -421,7 +478,9 @@ function Initialize-OrionFallbackSettingsFromArguments {
         'UseAnonymousPeapOuterIdentity',
         'PeapPhase2SetLengthBit',
         'PeapPhase2AckBeforeData',
-        'DebugOutput'
+        'DebugOutput',
+        'CaptureDebugOnFailure',
+        'DebugLogDirectory'
     )
 
     $positionalIndex = 0
@@ -464,6 +523,7 @@ function Initialize-OrionFallbackSettingsFromArguments {
             'PeapPhase2SetLengthBit' { $script:OrionFallbackSettings.PeapPhase2SetLengthBit = [bool]$value; continue }
             'PeapPhase2AckBeforeData' { $script:OrionFallbackSettings.PeapPhase2AckBeforeData = [bool]$value; continue }
             'DebugOutput' { $script:OrionFallbackSettings.DebugOutput = [bool]$value; continue }
+            'CaptureDebugOnFailure' { $script:OrionFallbackSettings.CaptureDebugOnFailure = [bool]$value; continue }
             'Port' { $script:OrionFallbackSettings.Port = [int]$value; continue }
             'TimeoutSeconds' { $script:OrionFallbackSettings.TimeoutSeconds = [int]$value; continue }
             'MaxEapRounds' { $script:OrionFallbackSettings.MaxEapRounds = [int]$value; continue }
@@ -516,7 +576,12 @@ function Apply-OrionFallbackSettings {
             if (-not $value) {
                 continue
             }
-            Set-Variable -Name $name -Value ([System.Management.Automation.SwitchParameter]::Present) -Scope Script
+            if ($name -eq "CaptureDebugOnFailure") {
+                # CaptureDebugOnFailure is [string], not [switch]/[bool] - see param block comment.
+                Set-Variable -Name $name -Value "1" -Scope Script
+            } else {
+                Set-Variable -Name $name -Value ([System.Management.Automation.SwitchParameter]::Present) -Scope Script
+            }
             continue
         }
 
@@ -598,6 +663,23 @@ if ([string]::IsNullOrWhiteSpace($Server)) {
     throw "Parameter -Server is required. Run the script with -help to view parameters and examples."
 }
 
+function Get-PrimaryLocalIPv4 {
+    try {
+        $hostName = [System.Net.Dns]::GetHostName()
+        $addresses = [System.Net.Dns]::GetHostAddresses($hostName) | Where-Object {
+            $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork -and
+            -not $_.IPAddressToString.StartsWith("127.") -and
+            -not $_.IPAddressToString.StartsWith("169.254.")
+        }
+        if ($addresses -and $addresses.Count -gt 0) {
+            return $addresses[0].IPAddressToString
+        }
+    } catch {
+        return $null
+    }
+    return $null
+}
+
 $script:StartupBoundParameters = @{}
 foreach ($entry in $PSBoundParameters.GetEnumerator()) {
     $script:StartupBoundParameters[$entry.Key] = $entry.Value
@@ -623,15 +705,39 @@ if ($UseRadSec.IsPresent) {
     }
 }
 
+if (-not $PSBoundParameters.ContainsKey("NasIpAddress") -and ([string]::IsNullOrWhiteSpace($NasIpAddress) -or $NasIpAddress -eq "127.0.0.1")) {
+    # Auto-detect a real NAS-IP-Address whenever the caller relies on the loopback default,
+    # regardless of Orion-mode detection, since Portnox's backend rejects 127.0.0.1.
+    $detectedNasIp = Get-PrimaryLocalIPv4
+    if (-not [string]::IsNullOrWhiteSpace($detectedNasIp)) {
+        $NasIpAddress = $detectedNasIp
+    }
+}
+
 if ($AuthType -eq "PAP") {
     if (-not $Username) { throw "Parameter -Username is required for PAP." }
     if (-not $Password) { throw "Parameter -Password is required for PAP." }
 } elseif ($AuthType -eq "MAB") {
-    if (-not $Username) { $Username = $CallingStationId }
+    # MAB identity is always the Calling-Station-Id (the MAC being authenticated). This is
+    # unconditional - not gated on $PSBoundParameters - because argument-binding behavior for
+    # the Orion sentinel invocation can differ across PowerShell hosts/versions, and any stray
+    # or sentinel value (e.g. "Orion") reaching User-Name causes Portnox's backend to reject
+    # the request with an HTTP 400. MAB has no legitimate use case for a distinct -Username.
+    if (-not $CallingStationId) {
+        throw "Parameter -CallingStationId is required for MAB."
+    }
+    $Username = $CallingStationId
     if (-not $Password) { $Password = $Username }
-    if (-not $Username) { throw "Parameter -Username or -CallingStationId is required for MAB." }
 } else {
     if (-not $Username) { $Username = "eapuser" }
+    if ($Username -eq "Orion") {
+        # Same class of issue as the MAB Orion-sentinel fix above: "Orion" reaching Username here
+        # is never a legitimate credential. Unlike MAB, this can't be silently substituted with a
+        # sane default (there's no equivalent of Calling-Station-Id to fall back to), so surface it
+        # as an explicit, actionable error rather than letting it silently reach the wire and fail
+        # opaquely downstream (e.g. as a confusing Portnox auth rejection).
+        throw "Username resolved to the literal value 'Orion' (the Orion-mode sentinel token), not a real credential. This usually means the SolarWinds SAM Script Arguments 'Username=' field is missing, blank, or was accidentally left as a leftover template/sentinel value. Check that monitor's Script Arguments configuration."
+    }
     if ($AuthType -eq "EAP-PEAP" -and -not $Password) { throw "Parameter -Password is required for EAP-PEAP (MSCHAPv2 inner auth)." }
     if ($AuthType -eq "EAP-TTLS" -and -not $Password) { throw "Parameter -Password is required for EAP-TTLS (tunneled PAP auth)." }
     if (-not $EapClientCertPath) { $EapClientCertPath = $ClientCertPath }
@@ -1634,16 +1740,10 @@ function Parse-RadiusResponse {
 function New-TlsStream {
     param(
         [string] $Server,[int] $Port,[string] $RootCACertPath,[string] $ClientCertPath,[SecureString]$ClientCertPassword,
-        [bool] $SkipCertCheck,[bool] $SkipRevocation,[int] $TimeoutMs
+        [bool] $SkipCertCheck,[bool] $SkipRevocation,[int] $TimeoutMs,
+        [bool] $Diag = $false,
+        [int] $MaxRetries = 2
     )
-
-    $tcp = New-Object System.Net.Sockets.TcpClient
-    try {
-        $t = $tcp.ConnectAsync($Server,$Port)
-        if (-not $t.Wait($TimeoutMs)) { throw "TCP connect timeout." }
-    } catch {
-        throw "Failed to connect to $Server on port $Port : $($_.Exception.Message)"
-    }
 
     $certs = [System.Security.Cryptography.X509Certificates.X509CertificateCollection]::new()
     if ($ClientCertPath) {
@@ -1696,19 +1796,76 @@ public static class RadSecStreamFactory {
         [RadSecStreamFactory]::TrustedRoot = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($RootCACertPath)
     }
 
-    $ssl = [RadSecStreamFactory]::CreateSslStream($tcp.GetStream())
     $checkRevocation = -not $SkipRevocation
-    try {
-        $a = $ssl.AuthenticateAsClientAsync(
-            $Server, $certs,
-            [System.Security.Authentication.SslProtocols]::Tls12 -bor [System.Security.Authentication.SslProtocols]::Tls13,
-            $checkRevocation
-        )
-        if (-not $a.Wait($TimeoutMs)) { throw "RadSec TLS handshake timeout." }
-    } catch {
-         throw "RadSec TLS Authentication layer failed: $($_.Exception.Message)"
+
+    # Bounded retry for the initial TCP connect + TLS handshake: intermittent RADSEC connection
+    # failures are commonly caused by transient network blips during the TCP handshake, or by
+    # certificate revocation checking (OCSP/CRL lookups, enabled by default unless
+    # -SkipRevocationCheck is passed) briefly timing out against a slow/unreachable responder -
+    # neither indicates a real, persistent problem with the server or certificate, so a fresh
+    # retry attempt (new TCP connection + new TLS handshake) will very often just succeed.
+    $attempt = 0
+    while ($true) {
+        $tcp = $null
+        $ssl = $null
+        $stage = "connect"
+        try {
+            $tcp = New-Object System.Net.Sockets.TcpClient
+            try {
+                $t = $tcp.ConnectAsync($Server,$Port)
+                if (-not $t.Wait($TimeoutMs)) { throw "TCP connect timeout." }
+            } catch {
+                throw "Failed to connect to $Server on port $Port : $($_.Exception.Message)"
+            }
+
+            $stage = "tls"
+            $ssl = [RadSecStreamFactory]::CreateSslStream($tcp.GetStream())
+            $a = $ssl.AuthenticateAsClientAsync(
+                $Server, $certs,
+                [System.Security.Authentication.SslProtocols]::Tls12 -bor [System.Security.Authentication.SslProtocols]::Tls13,
+                $checkRevocation
+            )
+            if (-not $a.Wait($TimeoutMs)) { throw "RadSec TLS handshake timeout." }
+
+            return @{ Tcp=$tcp; Ssl=$ssl }
+        } catch {
+            try { if ($ssl) { $ssl.Dispose() } } catch {}
+            try { if ($tcp) { $tcp.Close() } } catch {}
+
+            # $_.Exception is typically a System.Management.Automation.MethodInvocationException wrapping
+            # an AggregateException from Task.Wait(); its top-level .Message is the unhelpful generic
+            # "One or more errors occurred." Unwrap down to the real TLS negotiation failure reason
+            # (e.g. certificate validation failure, protocol/cipher mismatch, connection reset) so
+            # failures are actionable instead of opaque.
+            $msg = $_.Exception
+            while ($msg -is [System.Management.Automation.MethodInvocationException] -and $msg.InnerException) {
+                $msg = $msg.InnerException
+            }
+            if ($msg -is [System.AggregateException]) {
+                $inner = $msg.Flatten().InnerExceptions
+                if ($inner -and $inner.Count -gt 0) {
+                    $msg = $inner[0]
+                }
+            }
+
+            if ($attempt -lt $MaxRetries) {
+                $attempt++
+                if ($Diag) {
+                    Write-Host (" [DBG] RadSec {0} failed ({1}); retrying with a fresh connection (retry {2}/{3})..." -f $stage, $msg.Message, $attempt, $MaxRetries) -ForegroundColor Yellow
+                }
+                continue
+            }
+
+            $hint = ""
+            if ($msg.Message -match "certificate is invalid" -or $msg.Message -match "authentication failed" -or $msg.Message -match "TrustFailure") {
+                $hint = " Hint: provide -RootCACertPath, or use -SkipCertificateCheck for lab testing, if the RADSEC server certificate isn't trusted. If this failure is intermittent rather than persistent, also consider -SkipRevocationCheck to rule out transient OCSP/CRL lookup timeouts."
+            }
+            if ($stage -eq "connect") {
+                throw $msg.Message
+            }
+            throw "RadSec TLS Authentication layer failed: $($msg.Message)$hint"
+        }
     }
-    return @{ Tcp=$tcp; Ssl=$ssl }
 }
 
 # Reads one full RADSEC framed RADIUS packet (4-byte framing + remaining bytes).
@@ -1816,6 +1973,39 @@ function Read-RadiusResponsePacket {
     }
 
     return $packet
+}
+
+# Sends a request and reads its response, automatically retransmitting the exact same
+# packet bytes (same Identifier/Request Authenticator, per RFC 2865 client retransmission
+# guidance) on a UDP RADIUS timeout before giving up. RADSEC (TCP/TLS) is never retried here:
+# TCP already guarantees delivery/ordering at the transport layer, so a stalled TLS stream
+# read indicates a different class of failure that retransmission would not fix.
+function Send-AndReceiveRadiusPacket {
+    param(
+        $Connection,
+        [byte[]] $Packet,
+        [ValidateSet("RADSEC","RADIUS")] [string] $TransportMode,
+        [int] $TimeoutMs,
+        [bool] $Diag,
+        [int] $MaxRetries = 2
+    )
+
+    $attempt = 0
+    while ($true) {
+        Send-RadiusRequestPacket -Connection $Connection -Packet $Packet -TransportMode $TransportMode
+        try {
+            return Read-RadiusResponsePacket -Connection $Connection -TimeoutMs $TimeoutMs -Diag $Diag -TransportMode $TransportMode
+        } catch {
+            $isUdpTimeout = ($TransportMode -eq "RADIUS") -and ($_.Exception.Message -match "Timeout waiting for RADIUS UDP response")
+            if (-not $isUdpTimeout -or $attempt -ge $MaxRetries) {
+                throw
+            }
+            $attempt++
+            if ($Diag) {
+                Write-Host (" [DBG] UDP RADIUS response timeout; retransmitting same request (retry {0}/{1})..." -f $attempt, $MaxRetries) -ForegroundColor Yellow
+            }
+        }
+    }
 }
 #endregion
 
@@ -1940,9 +2130,15 @@ function Write-AuthenticationSummary {
         [long] $ElapsedMilliseconds
     )
 
+    $orionStatistic = [long]$ElapsedMilliseconds
+    if ($FinalResponse -ne "Access-Accept") {
+        # In Orion mode, use 0 on auth failure so threshold-based monitors can mark the component down.
+        $orionStatistic = 0
+    }
+
     if ($script:IsOrionMode -and -not $EmitResultObject.IsPresent) {
-        echo ("Statistic: {0}" -f [long]$ElapsedMilliseconds)
-        echo ("Message: {0}" -f $FinalResponse)
+        echo ("Statistic: {0}" -f $orionStatistic)
+        echo ("Message: {0} (elapsed={1}ms)" -f $FinalResponse, [long]$ElapsedMilliseconds)
         $script:OrionExitCode = Get-OrionExitCode -FinalResponse $FinalResponse
         [Environment]::ExitCode = [int]$script:OrionExitCode
     } elseif (-not $EmitResultObject.IsPresent) {
@@ -1955,7 +2151,7 @@ function Write-AuthenticationSummary {
         Write-Host " AuthType  : $(Get-AuthTypeSummaryLabel -Type $AuthType)"
         Write-Host " Username  : $Username"
         Write-Host " NAS-ID    : $NasIdentifier"
-        Write-Host " Secret    : $SharedSecret"
+        Write-Host " Secret    : $('*' * 8)"
         Write-Host " Response  : $FinalResponse"
         Write-Host " Time      : $ElapsedMilliseconds ms"
         echo ("Statistic: {0}" -f [long]$ElapsedMilliseconds)
@@ -2062,7 +2258,7 @@ function Start-ContinuousMode {
 
     $childParams = @{}
     foreach ($entry in $script:StartupBoundParameters.GetEnumerator()) {
-        if ($entry.Key -in @("continuous","ShowHelp","EmitResultObject")) { continue }
+        if ($entry.Key -in @("continuous","ShowHelp","EmitResultObject","RemainingArguments")) { continue }
         $childParams[$entry.Key] = $entry.Value
     }
     $childParams["EmitResultObject"] = $true
@@ -2112,6 +2308,26 @@ if ($continuous.IsPresent) {
 
 $script:OrionExitCode = $null
 
+# Optional failure-only debug capture: force full diagnostic verbosity into a transcript file
+# for this run, then keep the file only if the run did not end in Access-Accept. This lets
+# Orion/SAM monitors stay quiet on success while still auto-producing a full DBG transcript
+# whenever a monitor fails or errors.
+$script:DebugTranscriptStarted = $false
+$script:DebugTranscriptPath = $null
+if ((Test-TruthyToken -Value $CaptureDebugOnFailure) -and -not $EmitResultObject.IsPresent) {
+    $DebugOutput = [System.Management.Automation.SwitchParameter]::Present
+    try {
+        if (-not (Test-Path -LiteralPath $DebugLogDirectory)) {
+            New-Item -ItemType Directory -Path $DebugLogDirectory -Force | Out-Null
+        }
+        $script:DebugTranscriptPath = Join-Path ([System.IO.Path]::GetTempPath()) ("PortnoxRadiusDebug_{0}.tmp.log" -f ([Guid]::NewGuid().ToString("N")))
+        Start-Transcript -Path $script:DebugTranscriptPath -Force | Out-Null
+        $script:DebugTranscriptStarted = $true
+    } catch {
+        $script:DebugTranscriptStarted = $false
+    }
+}
+
 if ($DebugOutput.IsPresent) {
     # Debug banner prints only when verbose tracing is explicitly requested.
     Write-Host ""
@@ -2135,7 +2351,7 @@ if ($DebugOutput.IsPresent) {
         Write-Host " NAK Types : $desiredTypeLabels"
     }
     Write-Host " NAS-ID    : $NasIdentifier"
-    Write-Host " Secret    : $SharedSecret"
+    Write-Host " Secret    : $('*' * 8)"
     Write-Host ""
 }
 
@@ -2147,7 +2363,8 @@ try {
     if ($Transport -eq "RADSEC") {
         $connection = New-TlsStream -Server $Server -Port $Port -RootCACertPath $RootCACertPath `
             -ClientCertPath $ClientCertPath -ClientCertPassword $ClientCertPassword `
-            -SkipCertCheck $SkipCertificateCheck.IsPresent -SkipRevocation $SkipRevocationCheck.IsPresent -TimeoutMs $timeoutMs
+            -SkipCertCheck $SkipCertificateCheck.IsPresent -SkipRevocation $SkipRevocationCheck.IsPresent -TimeoutMs $timeoutMs `
+            -Diag $DebugOutput.IsPresent -MaxRetries 2
     } else {
         $connection = New-RadiusUdpConnection -Server $Server -Port $Port -TimeoutMs $timeoutMs
     }
@@ -2158,12 +2375,18 @@ try {
         $req = Build-AccessRequest -Username $Username -Password $Password -SharedSecret $SharedSecret `
             -NasIdentifier $NasIdentifier -NasPortId $NasPortId -NasPortType $NasPortType -NasIpAddress $NasIpAddress -CallingStationId $CallingStationId -CalledStationId $CalledStationId `
             -Identifier $rid -AuthType $AuthType
-        Send-RadiusRequestPacket -Connection $connection -Packet $req -TransportMode $Transport
-        $resp = Parse-RadiusResponse -Data (Read-RadiusResponsePacket -Connection $connection -TimeoutMs $timeoutMs -Diag $DebugOutput.IsPresent -TransportMode $Transport) -Diag $DebugOutput.IsPresent
+        $respData = Send-AndReceiveRadiusPacket -Connection $connection -Packet $req -TransportMode $Transport -TimeoutMs $timeoutMs -Diag $DebugOutput.IsPresent -MaxRetries 2
+        $resp = Parse-RadiusResponse -Data $respData -Diag $DebugOutput.IsPresent
         $stopwatch.Stop()
         Write-AuthenticationSummary -Server $Server -Port $Port -Transport $Transport -AuthType $AuthType -Username $Username `
             -NasIdentifier $NasIdentifier -SharedSecret $SharedSecret -FinalResponse $resp.CodeName -ElapsedMilliseconds $stopwatch.ElapsedMilliseconds
-        return
+        if ($EmitResultObject.IsPresent) {
+            return
+        }
+        # Always enforce a correct process exit code here (0 only for Access-Accept), regardless
+        # of whether Orion-mode auto-detection classified this invocation as Orion or not.
+        if ($null -eq $script:OrionExitCode) { $script:OrionExitCode = 1 }
+        exit ([int]$script:OrionExitCode)
     }
 
     $engine = $null
@@ -2231,12 +2454,12 @@ try {
             -NasIdentifier $NasIdentifier -NasPortId $NasPortId -NasPortType $NasPortType -NasIpAddress $NasIpAddress -CallingStationId $CallingStationId -CalledStationId $CalledStationId `
             -Identifier $rid -AuthType $AuthType -EapMessage $nextEap -State $state
 
-        Send-RadiusRequestPacket -Connection $connection -Packet $req -TransportMode $Transport
         if ($DebugOutput.IsPresent) {
             Write-Host " >> Access-Request(EAP) sent (round=$round, id=$rid, eapId=$eapId)" -ForegroundColor Yellow
         }
 
-        $resp = Parse-RadiusResponse -Data (Read-RadiusResponsePacket -Connection $connection -TimeoutMs $timeoutMs -Diag $DebugOutput.IsPresent -TransportMode $Transport) -Diag $DebugOutput.IsPresent
+        $respData = Send-AndReceiveRadiusPacket -Connection $connection -Packet $req -TransportMode $Transport -TimeoutMs $timeoutMs -Diag $DebugOutput.IsPresent -MaxRetries 2
+        $resp = Parse-RadiusResponse -Data $respData -Diag $DebugOutput.IsPresent
         if ($DebugOutput.IsPresent) {
             Write-Host " << Response: $($resp.CodeName) (round=$round)" -ForegroundColor Cyan
         }
@@ -2745,13 +2968,35 @@ finally {
         try { if ($connection.Tcp) { $connection.Tcp.Close() } } catch {}
         try { if ($connection.Udp) { $connection.Udp.Close() } } catch {}
     }
+    if ($script:DebugTranscriptStarted) {
+        try { Stop-Transcript | Out-Null } catch {}
+        $isFailureRun = ($null -eq $script:OrionExitCode) -or ([int]$script:OrionExitCode -ne 0)
+        if ($isFailureRun) {
+            $resultLabel = if ($null -ne $script:OrionExitCode -and [int]$script:OrionExitCode -eq 3) { "Reject" } else { "Failure" }
+            $safeServer = ($Server -replace '[^A-Za-z0-9\.\-]', '_')
+            # Include Port, Transport (RADSEC/RADIUS), and AuthType in the filename itself so
+            # failures can be triaged/filtered from a directory listing alone, without opening
+            # every file - e.g. to isolate periodic RADSEC-only failures.
+            $finalLogName = "PortnoxRadiusDebug_{0}_{1}_{2}_{3}_{4}_{5}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"), $safeServer, $Port, $Transport, $AuthType, $resultLabel
+            $finalLogPath = Join-Path $DebugLogDirectory $finalLogName
+            try {
+                Move-Item -LiteralPath $script:DebugTranscriptPath -Destination $finalLogPath -Force
+            } catch {
+                # Best-effort: leave the temp transcript file in place if the move fails.
+            }
+        } else {
+            try { Remove-Item -LiteralPath $script:DebugTranscriptPath -Force -ErrorAction SilentlyContinue } catch {}
+        }
+    }
     if (-not $EmitResultObject.IsPresent -and -not $script:IsOrionMode) {
         Write-Host "---------------------------------------------------" -ForegroundColor Cyan
         Write-Host ""
     }
 }
 
-if ($script:IsOrionMode -and -not $EmitResultObject.IsPresent) {
+if (-not $EmitResultObject.IsPresent) {
+    # Enforce exit code unconditionally (not just in Orion mode) so any caller can rely on
+    # 0 = Access-Accept, non-zero = failure/reject.
     if ($null -eq $script:OrionExitCode) {
         $script:OrionExitCode = 1
     }
