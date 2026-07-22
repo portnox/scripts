@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "portnox-mcp": {
+      "command": "/opt/homebrew/bin/python3",
+      "args": [
+        "/Volumes/share/MCP/MCP Server.py",
+        "--transport",
+        "stdio"
+      ],
+      "env": {
+        "PORTNOX_BASE_URL": "https://clear.portnox.com:8081/CloudPortalBackEnd",
+        "PORTNOX_TOKEN_FILE": "/Volumes/share/MCP/secrets/portnox_token.txt",
+        "PORTNOX_TIMEOUT_SECONDS": "30",
+        "PORTNOX_VERIFY_TLS": "true"
+      }
+    }
+  }
+}
