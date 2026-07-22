@@ -60,10 +60,17 @@
             Expected DNS name for inner EAP-TLS, EAP-TTLS, or PEAP server certificate validation.
         -SkipEapServerCertCheck
             Disables inner EAP server certificate validation for lab or troubleshooting use.
+            [string]-typed flag - pass 1/true/yes/on to enable, e.g. -SkipEapServerCertCheck 1 or,
+            in Orion Script Arguments, SkipEapServerCertCheck=1.
         -SkipCertificateCheck
             Disables outer RADSEC server certificate validation for lab or troubleshooting use.
+            [string]-typed flag - pass 1/true/yes/on to enable, e.g. -SkipCertificateCheck 1 or,
+            in Orion Script Arguments, SkipCertificateCheck=1.
         -SkipRevocationCheck
-            Disables certificate revocation checking for outer RADSEC validation.
+            Disables certificate revocation checking (OCSP/CRL lookups) for outer RADSEC
+            validation and for the inner EAP-TLS/EAP-TTLS/PEAP server certificate validation.
+            [string]-typed flag - pass 1/true/yes/on to enable, e.g. -SkipRevocationCheck 1 or,
+            in Orion Script Arguments, SkipRevocationCheck=1.
         -TimeoutSeconds
             Per-request timeout in seconds for network and EAP round processing. For UDP RADIUS
             (Transport RADIUS), each round automatically retransmits the same request up to 2
@@ -191,10 +198,18 @@ param(
     [SecureString] $EapClientCertPassword,
     [string] $EapRootCACertPath,
     [string] $EapServerName,
-    [switch] $SkipEapServerCertCheck,
 
-    [switch] $SkipCertificateCheck,
-    [switch] $SkipRevocationCheck,
+    # Intentionally [string] rather than [switch]/[bool]: SolarWinds SAM decomposes
+    # comma-separated "Name=Value" Script Arguments into individually PSRP-bound named
+    # parameters, passing an explicit System.String value (e.g. "1") for SkipRevocationCheck=1.
+    # That binding fails hard for [switch]/[bool] params - PowerShell's ArgumentTypeConverterAttribute
+    # (auto-applied to those types) rejects any System.String value, even "1". [string] has no
+    # such converter, so PSRP binding always succeeds; truthiness is evaluated manually via
+    # Test-TruthyToken.
+    [string] $SkipEapServerCertCheck = "",
+
+    [string] $SkipCertificateCheck = "",
+    [string] $SkipRevocationCheck = "",
 
     [int] $TimeoutSeconds = 15,
     [int] $MaxEapRounds = 60,
@@ -302,9 +317,10 @@ $script:IsOrionMode = $Orion.IsPresent
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# Manually interprets a raw string value (from -CaptureDebugOnFailure or similar
-# string-typed flag parameters) as a boolean, since these parameters are intentionally
-# NOT [switch]/[bool] typed - see the -CaptureDebugOnFailure param block comment for why.
+# Manually interprets a raw string value (from -CaptureDebugOnFailure, -SkipEapServerCertCheck,
+# -SkipCertificateCheck, -SkipRevocationCheck, or similar string-typed flag parameters) as a
+# boolean, since these parameters are intentionally NOT [switch]/[bool] typed - see the
+# corresponding param block comments for why.
 function Test-TruthyToken {
     param([string] $Value)
     if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
@@ -576,8 +592,8 @@ function Apply-OrionFallbackSettings {
             if (-not $value) {
                 continue
             }
-            if ($name -eq "CaptureDebugOnFailure") {
-                # CaptureDebugOnFailure is [string], not [switch]/[bool] - see param block comment.
+            if ($name -in @("CaptureDebugOnFailure", "SkipEapServerCertCheck", "SkipCertificateCheck", "SkipRevocationCheck")) {
+                # These are [string], not [switch]/[bool] - see param block comments.
                 Set-Variable -Name $name -Value "1" -Scope Script
             } else {
                 Set-Variable -Name $name -Value ([System.Management.Automation.SwitchParameter]::Present) -Scope Script
@@ -1759,6 +1775,13 @@ function New-TlsStream {
         $certs.Add($cc) | Out-Null
     }
 
+    # NOTE: SolarWinds SAM/PSRP hosts long-lived, persistent PowerShell processes across monitor
+    # runs. Add-Type cannot redefine an existing type within the same process/AppDomain, so if a
+    # process already loaded an OLDER version of this class (missing a field/member this version
+    # relies on), setting that member below throws "property ... cannot be found on this object".
+    # In practice this self-resolves: expect up to two Orion polling cycles of failures after
+    # changing this class's members before every worker process has cycled to a fresh one running
+    # the current definition - no action needed beyond waiting it out.
     if (-not ([System.Management.Automation.PSTypeName]"RadSecStreamFactory").Type) {
         Add-Type -Language CSharp @"
 using System;
@@ -1768,7 +1791,9 @@ public static class RadSecStreamFactory {
   public static X509Certificate2 TrustedRoot = null;
   public static bool SkipRevocation = false;
   public static bool SkipAll = false;
+  public static string LastValidationDetail = "";
   private static bool Validate(object sender, X509Certificate cert, X509Chain chain, SslPolicyErrors errors) {
+    LastValidationDetail = "";
     if (SkipAll) return true;
     if (TrustedRoot != null) {
       chain.ChainPolicy.ExtraStore.Add(TrustedRoot);
@@ -1776,8 +1801,23 @@ public static class RadSecStreamFactory {
       if (SkipRevocation) chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
       bool built = chain.Build(new X509Certificate2(cert));
       X509Certificate2 root = chain.ChainElements[chain.ChainElements.Count - 1].Certificate;
-      return built && root.Thumbprint == TrustedRoot.Thumbprint;
+      bool rootMatches = root.Thumbprint == TrustedRoot.Thumbprint;
+      var sb = new System.Text.StringBuilder();
+      sb.Append("SslPolicyErrors=").Append(errors).Append("; Built=").Append(built).Append("; RootMatches=").Append(rootMatches);
+      foreach (var s in chain.ChainStatus) {
+        sb.Append("; ").Append(s.Status).Append(": ").Append(s.StatusInformation.Trim());
+      }
+      LastValidationDetail = sb.ToString();
+      return built && rootMatches;
     }
+    var sb2 = new System.Text.StringBuilder();
+    sb2.Append("SslPolicyErrors=").Append(errors);
+    if (chain != null && chain.ChainStatus != null) {
+      foreach (var s in chain.ChainStatus) {
+        sb2.Append("; ").Append(s.Status).Append(": ").Append(s.StatusInformation.Trim());
+      }
+    }
+    LastValidationDetail = sb2.ToString();
     return errors == SslPolicyErrors.None;
   }
   public static SslStream CreateSslStream(System.Net.Sockets.NetworkStream ns) {
@@ -1860,10 +1900,12 @@ public static class RadSecStreamFactory {
             if ($msg.Message -match "certificate is invalid" -or $msg.Message -match "authentication failed" -or $msg.Message -match "TrustFailure") {
                 $hint = " Hint: provide -RootCACertPath, or use -SkipCertificateCheck for lab testing, if the RADSEC server certificate isn't trusted. If this failure is intermittent rather than persistent, also consider -SkipRevocationCheck to rule out transient OCSP/CRL lookup timeouts."
             }
+            $detail = ""
+            if ([RadSecStreamFactory]::LastValidationDetail) { $detail = " ValidationDetail: $([RadSecStreamFactory]::LastValidationDetail)" }
             if ($stage -eq "connect") {
                 throw $msg.Message
             }
-            throw "RadSec TLS Authentication layer failed: $($msg.Message)$hint"
+            throw "RadSec TLS Authentication layer failed: $($msg.Message)$hint$detail"
         }
     }
 }
@@ -2010,6 +2052,23 @@ function Send-AndReceiveRadiusPacket {
 #endregion
 
 #region --- Inner EAP-TLS engine using SslStream over pipe
+# Builds the hint text appended to inner EAP-TLS failures. Special-cases a hostname/SAN
+# mismatch (proven via [EapTlsStreamFactory]::LastValidationDetail) with specific guidance,
+# since that failure mode looks identical to a chain/revocation failure otherwise and was
+# previously misdiagnosed as one.
+function Get-EapTlsCertValidationHint {
+    $detail = [EapTlsStreamFactory]::LastValidationDetail
+    if ($detail -match "NameMatches=False" -or $detail -match "RemoteCertificateNameMismatch") {
+        $hint = " Hint: the server certificate's DNS name does not match -EapServerName. Set -EapServerName to the exact CN/SAN the server presents (see CertName= in ValidationDetail below), not a tenant-specific or vanity hostname that may only be valid for -Server connectivity."
+    } else {
+        $hint = " Hint: provide -EapRootCACertPath (or -RootCACertPath for fallback), set -EapServerName to the cert DNS name when connecting to an IP, use -SkipEapServerCertCheck for lab testing, or if this failure is intermittent rather than persistent, use -SkipRevocationCheck to rule out transient OCSP/CRL lookup timeouts."
+    }
+    if ($detail) {
+        $hint += " ValidationDetail: $detail"
+    }
+    return $hint
+}
+
 # Creates the inner TLS engine used by EAP-TLS, EAP-TTLS, and PEAP outer methods.
 function New-EapTlsEngine {
     param(
@@ -2018,7 +2077,8 @@ function New-EapTlsEngine {
         [SecureString] $ClientCertPassword,
         [string] $RootCaPath,
         [switch] $SkipServerCertCheck,
-        [switch] $ForceTls12
+        [switch] $ForceTls12,
+        [switch] $SkipRevocationCheck
     )
 
     $pipe = New-Object EapTlsPipeStream
@@ -2042,6 +2102,14 @@ function New-EapTlsEngine {
         $trustedRoot = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($RootCaPath)
     }
 
+        # NOTE: SolarWinds SAM/PSRP hosts long-lived, persistent PowerShell processes across
+        # monitor runs. Add-Type cannot redefine an existing type within the same process/AppDomain,
+        # so if a process already loaded an OLDER version of this class (missing a field/member this
+        # version relies on), setting that member below throws "property ... cannot be found on this
+        # object" (e.g. this bit ExpectedServerName the first time it was added). In practice this
+        # self-resolves: expect up to two Orion polling cycles of failures after changing this
+        # class's members before every worker process has cycled to a fresh one running the current
+        # definition - no action needed beyond waiting it out.
         if (-not ([System.Management.Automation.PSTypeName]"EapTlsStreamFactory").Type) {
                 Add-Type -Language CSharp @"
 using System;
@@ -2052,19 +2120,49 @@ using System.Security.Cryptography.X509Certificates;
 public static class EapTlsStreamFactory {
     public static X509Certificate2 TrustedRoot = null;
     public static bool SkipAll = false;
+    public static bool SkipRevocation = false;
+    public static string ExpectedServerName = null;
+    public static string LastValidationDetail = "";
 
     private static bool Validate(object sender, X509Certificate cert, X509Chain chain, SslPolicyErrors errors) {
+        LastValidationDetail = "";
         if (SkipAll) return true;
         if (TrustedRoot != null) {
-            if (chain == null || cert == null) return false;
+            if (chain == null || cert == null) { LastValidationDetail = "chain or cert was null"; return false; }
             chain.ChainPolicy.ExtraStore.Add(TrustedRoot);
             chain.ChainPolicy.VerificationFlags = X509VerificationFlags.AllowUnknownCertificateAuthority;
-            chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
-            bool built = chain.Build(new X509Certificate2(cert));
-            if (chain.ChainElements == null || chain.ChainElements.Count == 0) return false;
+            if (SkipRevocation) chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+            X509Certificate2 leaf = new X509Certificate2(cert);
+            bool built = chain.Build(leaf);
+            var sb = new System.Text.StringBuilder();
+            sb.Append("SslPolicyErrors=").Append(errors).Append("; Built=").Append(built);
+            foreach (var s in chain.ChainStatus) {
+                sb.Append("; ").Append(s.Status).Append(": ").Append(s.StatusInformation.Trim());
+            }
+            if (chain.ChainElements == null || chain.ChainElements.Count == 0) {
+                sb.Append("; ChainElements=0");
+                LastValidationDetail = sb.ToString();
+                return false;
+            }
             X509Certificate2 root = chain.ChainElements[chain.ChainElements.Count - 1].Certificate;
-            return built && string.Equals(root.Thumbprint, TrustedRoot.Thumbprint, StringComparison.OrdinalIgnoreCase);
+            bool rootMatches = string.Equals(root.Thumbprint, TrustedRoot.Thumbprint, StringComparison.OrdinalIgnoreCase);
+            bool nameOk = true;
+            string certName = leaf.GetNameInfo(X509NameType.DnsName, false);
+            if (!string.IsNullOrEmpty(ExpectedServerName)) {
+                nameOk = string.Equals(certName, ExpectedServerName, StringComparison.OrdinalIgnoreCase);
+            }
+            sb.Append("; RootMatches=").Append(rootMatches).Append("; CertName=").Append(certName).Append("; ExpectedServerName=").Append(ExpectedServerName).Append("; NameMatches=").Append(nameOk);
+            LastValidationDetail = sb.ToString();
+            return built && rootMatches && nameOk;
         }
+        var sb2 = new System.Text.StringBuilder();
+        sb2.Append("SslPolicyErrors=").Append(errors);
+        if (chain != null && chain.ChainStatus != null) {
+            foreach (var s in chain.ChainStatus) {
+                sb2.Append("; ").Append(s.Status).Append(": ").Append(s.StatusInformation.Trim());
+            }
+        }
+        LastValidationDetail = sb2.ToString();
         return errors == SslPolicyErrors.None;
     }
 
@@ -2077,16 +2175,28 @@ public static class EapTlsStreamFactory {
 
         [EapTlsStreamFactory]::SkipAll = $SkipServerCertCheck.IsPresent
         [EapTlsStreamFactory]::TrustedRoot = $trustedRoot
+        [EapTlsStreamFactory]::SkipRevocation = $SkipRevocationCheck.IsPresent
+        [EapTlsStreamFactory]::ExpectedServerName = $ServerName
         $ssl = [EapTlsStreamFactory]::CreateSslStream($pipe)
     $sslProtocols = if ($ForceTls12.IsPresent) {
         [System.Security.Authentication.SslProtocols]::Tls12
     } else {
         [System.Security.Authentication.SslProtocols]::Tls12 -bor [System.Security.Authentication.SslProtocols]::Tls13
     }
+    # NOTE: EapTlsStreamFactory.Validate has TWO independent code paths depending on whether a
+    # trusted root cert was supplied (-EapRootCACertPath, or its -RootCACertPath fallback):
+    #  - TrustedRoot != null: our own callback rebuilds the chain and gates revocation checking
+    #    on the [EapTlsStreamFactory]::SkipRevocation static field (set below).
+    #  - TrustedRoot == null: validation falls back to whatever SslPolicyErrors .NET/SChannel
+    #    computed itself, which is driven by this checkCertificateRevocation argument.
+    # Both paths are wired to -SkipRevocationCheck so a transient OCSP/CRL lookup timeout against
+    # the server cert's revocation responder (third-party CA infrastructure, outside our control)
+    # doesn't surface as a hard, indistinguishable-from-a-bad-certificate failure either way.
+    $checkRevocation = -not (Test-TruthyToken $SkipRevocationCheck)
     $task = $ssl.AuthenticateAsClientAsync(
         $ServerName, $certs,
         $sslProtocols,
-        $true
+        $checkRevocation
     )
     return [pscustomobject]@{ Pipe=$pipe; Ssl=$ssl; AuthTask=$task }
 }
@@ -2363,7 +2473,7 @@ try {
     if ($Transport -eq "RADSEC") {
         $connection = New-TlsStream -Server $Server -Port $Port -RootCACertPath $RootCACertPath `
             -ClientCertPath $ClientCertPath -ClientCertPassword $ClientCertPassword `
-            -SkipCertCheck $SkipCertificateCheck.IsPresent -SkipRevocation $SkipRevocationCheck.IsPresent -TimeoutMs $timeoutMs `
+            -SkipCertCheck (Test-TruthyToken $SkipCertificateCheck) -SkipRevocation (Test-TruthyToken $SkipRevocationCheck) -TimeoutMs $timeoutMs `
             -Diag $DebugOutput.IsPresent -MaxRetries 2
     } else {
         $connection = New-RadiusUdpConnection -Server $Server -Port $Port -TimeoutMs $timeoutMs
@@ -2551,7 +2661,8 @@ try {
                     Write-Host " [DBG] Initializing EAP-TLS inner engine..." -ForegroundColor DarkGray
                 }
                 $engine = New-EapTlsEngine -ServerName $EapServerName -ClientCertPath $EapClientCertPath -ClientCertPassword $EapClientCertPassword `
-                    -RootCaPath $EapRootCACertPath -SkipServerCertCheck:$SkipEapServerCertCheck.IsPresent -ForceTls12:($AuthType -eq "EAP-PEAP")
+                    -RootCaPath $EapRootCACertPath -SkipServerCertCheck:(Test-TruthyToken $SkipEapServerCertCheck) -ForceTls12:($AuthType -eq "EAP-PEAP") `
+                    -SkipRevocationCheck:(Test-TruthyToken $SkipRevocationCheck)
                 $pipe = $engine.Pipe
                 $tlsTask = $engine.AuthTask
 
@@ -2681,7 +2792,7 @@ try {
                         if ($msg.InnerException) { $msg = $msg.InnerException }
                         $hint = ""
                         if ($msg.Message -match "certificate is invalid" -or $msg.Message -match "authentication failed") {
-                            $hint = " Hint: provide -EapRootCACertPath (or -RootCACertPath for fallback), set -EapServerName to the cert DNS name when connecting to an IP, or use -SkipEapServerCertCheck for lab testing."
+                            $hint = Get-EapTlsCertValidationHint
                         }
                         throw "Inner EAP-TLS engine failed during processing: $($msg.Message)$hint"
                     }
@@ -2692,6 +2803,30 @@ try {
                         }
                         break
                     }
+                }
+
+                # Guard against a race where the inner TLS engine writes a final fatal Alert
+                # record (e.g. bad_record_mac, certificate_unknown, decrypt_error) to the pipe
+                # in the same instant it faults the auth task. TakeOutgoingWait can return that
+                # alert's bytes a moment before $tlsTask.IsFaulted flips to true, which previously
+                # caused the alert to be forwarded to the RADIUS server as if it were legitimate
+                # handshake data - masking the real .NET/SChannel error and producing a confusing
+                # Access-Reject instead of a clear exception. Give the task a brief grace period
+                # to settle, then prefer surfacing the real fault over forwarding the alert.
+                if ($newOut.Length -gt 0 -and -not $tlsTask.IsCompleted) {
+                    Start-Sleep -Milliseconds 75
+                }
+                if ($tlsTask.IsFaulted) {
+                    $msg = $tlsTask.Exception
+                    if ($msg.InnerException) { $msg = $msg.InnerException }
+                    $hint = ""
+                    if ($msg.Message -match "certificate is invalid" -or $msg.Message -match "authentication failed") {
+                        $hint = Get-EapTlsCertValidationHint
+                    }
+                    if ($DebugOutput.IsPresent -and $newOut.Length -gt 0) {
+                        Write-Host (" [DBG] Discarding {0} byte(s) of engine output - task faulted instead of completing normally (likely a fatal TLS alert): {1}" -f $newOut.Length, (Bytes-ToHex $newOut)) -ForegroundColor Yellow
+                    }
+                    throw "Inner EAP-TLS engine failed during processing: $($msg.Message)$hint"
                 }
 
                 if ($newOut.Length -gt 0) {
@@ -2732,7 +2867,7 @@ try {
                             if ($msg.InnerException) { $msg = $msg.InnerException }
                             $hint = ""
                             if ($msg.Message -match "certificate is invalid" -or $msg.Message -match "authentication failed") {
-                                $hint = " Hint: provide -EapRootCACertPath (or -RootCACertPath for fallback), set -EapServerName to the cert DNS name when connecting to an IP, or use -SkipEapServerCertCheck for lab testing."
+                                $hint = Get-EapTlsCertValidationHint
                             }
                             throw "Inner EAP-TLS handshake failed: $($msg.Message)$hint"
                         }

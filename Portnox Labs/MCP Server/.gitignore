@@ -1,0 +1,8 @@
+.venv/
+venv/
+venv-test/
+__pycache__/
+*.pyc
+
+secrets/*
+!secrets/.gitkeep

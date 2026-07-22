@@ -1,0 +1,34 @@
+services:
+  portnox-mcp:
+    build: .
+    container_name: portnox-mcp
+    restart: unless-stopped
+    environment:
+      PORTNOX_BASE_URL: ${PORTNOX_BASE_URL:-https://clear.portnox.com:8081/CloudPortalBackEnd}
+      PORTNOX_TIMEOUT_SECONDS: ${PORTNOX_TIMEOUT_SECONDS:-30}
+      PORTNOX_VERIFY_TLS: ${PORTNOX_VERIFY_TLS:-true}
+      PORTNOX_TOKEN_FILE: /run/secrets/portnox_token
+      MCP_TRANSPORT: streamable-http
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 8765
+      MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-*}
+      MCP_FORCE_HOST_HEADER: ${MCP_FORCE_HOST_HEADER:-localhost:8765}
+      MCP_ENABLE_HTTPS: ${MCP_ENABLE_HTTPS:-false}
+      MCP_TLS_CERT_DIR: ${MCP_TLS_CERT_DIR:-/tmp/portnox-mcp-tls}
+      MCP_TLS_CERT_FILE: ${MCP_TLS_CERT_FILE:-}
+      MCP_TLS_KEY_FILE: ${MCP_TLS_KEY_FILE:-}
+      MCP_TLS_PFX_FILE: ${MCP_TLS_PFX_FILE:-}
+      MCP_TLS_PFX_PASSWORD: ${MCP_TLS_PFX_PASSWORD:-}
+      MCP_TLS_SELF_SIGNED_CN: ${MCP_TLS_SELF_SIGNED_CN:-localhost}
+    ports:
+      - "8765:8765"
+    secrets:
+      - source: portnox_token
+        target: portnox_token
+    read_only: true
+    tmpfs:
+      - /tmp
+
+secrets:
+  portnox_token:
+    file: ./secrets/portnox_token.txt
