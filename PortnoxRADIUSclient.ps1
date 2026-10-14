@@ -72,13 +72,19 @@
             [string]-typed flag - pass 1/true/yes/on to enable, e.g. -SkipRevocationCheck 1 or,
             in Orion Script Arguments, SkipRevocationCheck=1.
         -TimeoutSeconds
-            Per-request timeout in seconds for network and EAP round processing. For UDP RADIUS
+            Timeout in seconds (default 25) for network requests and initial EAP ClientHello
+            generation. RADSEC response headers and bodies each have a separate, bounded
+            read window. For UDP RADIUS
             (Transport RADIUS), each round automatically retransmits the same request up to 2
             additional times on timeout before failing, so a worst-case timed-out round can take
             up to 3x this value. For RADSEC (Transport RADSEC), the initial TCP connect + TLS
             handshake similarly retries up to 2 additional times (with a fresh connection each
             attempt) before failing, to absorb transient connection blips or brief certificate
-            revocation-check (OCSP/CRL) lookup timeouts.
+            revocation-check (OCSP/CRL) lookup timeouts. An established RADSEC connection
+            that times out, closes, or encounters a transient socket error during a packet
+            exchange is reconnected once, restarting authentication from scratch. Explicit
+            Access-Reject and certificate-validation failures do not trigger this replay.
+            Reported total elapsed time includes all attempts.
         -MaxEapRounds
             Maximum number of EAP rounds before aborting.
         -DesiredEapTypes
@@ -101,6 +107,7 @@
             Runs the script continuously with the same startup parameters and renders a rolling ASCII chart of the Time metric (ms).
         -DebugOutput
             Enables detailed diagnostic logging, packet parsing, and TLS fragment dumps.
+            TTLS tunneled PAP credentials are never dumped as plaintext or hex.
         -CaptureDebugOnFailure
             Forces full diagnostic verbosity (as if -DebugOutput were set) into a PowerShell
             transcript for this run. The transcript is discarded automatically when the run
@@ -211,7 +218,8 @@ param(
     [string] $SkipCertificateCheck = "",
     [string] $SkipRevocationCheck = "",
 
-    [int] $TimeoutSeconds = 15,
+    [ValidateRange(1,2147483)]
+    [int] $TimeoutSeconds = 25,
     [int] $MaxEapRounds = 60,
 
     [byte[]] $DesiredEapTypes,
@@ -1867,6 +1875,7 @@ public static class RadSecStreamFactory {
             )
             if (-not $a.Wait($TimeoutMs)) { throw "RadSec TLS handshake timeout." }
 
+            $ssl.WriteTimeout = $TimeoutMs
             return @{ Tcp=$tcp; Ssl=$ssl }
         } catch {
             try { if ($ssl) { $ssl.Dispose() } } catch {}
@@ -1910,18 +1919,53 @@ public static class RadSecStreamFactory {
     }
 }
 
-# Reads one full RADSEC framed RADIUS packet (4-byte framing + remaining bytes).
+# Async reads are bounded even when the peer leaves the TLS stream open without sending data.
+function Read-RadSecChunk {
+    param($SslStream, [byte[]] $Buffer, [int] $Offset, [int] $Count, [int] $TimeoutMs, [string] $TimeoutMessage)
+    if ($TimeoutMs -le 0) { throw [System.TimeoutException]::new($TimeoutMessage) }
+    try {
+        $task = $SslStream.ReadAsync($Buffer, $Offset, $Count)
+        if (-not $task.Wait($TimeoutMs)) {
+            throw [System.TimeoutException]::new($TimeoutMessage)
+        }
+        return $task.Result
+    } catch {
+        throw $_.Exception.GetBaseException()
+    }
+}
+
+function Test-RadSecStreamFault {
+    param([System.Exception] $Exception)
+    $cause = $Exception.GetBaseException()
+    if ($cause -is [System.Net.Sockets.SocketException]) {
+        return $cause.SocketErrorCode -in @(
+            [System.Net.Sockets.SocketError]::ConnectionReset,
+            [System.Net.Sockets.SocketError]::ConnectionAborted,
+            [System.Net.Sockets.SocketError]::TimedOut,
+            [System.Net.Sockets.SocketError]::NetworkDown,
+            [System.Net.Sockets.SocketError]::NetworkReset,
+            [System.Net.Sockets.SocketError]::NetworkUnreachable,
+            [System.Net.Sockets.SocketError]::HostDown,
+            [System.Net.Sockets.SocketError]::HostUnreachable,
+            [System.Net.Sockets.SocketError]::Shutdown
+        )
+    }
+    return ($cause -is [System.TimeoutException] -or $cause -is [System.IO.IOException])
+}
+
+# Reads one full RADSEC RADIUS packet, with independent header and body deadlines.
 function Read-RadiusPacket {
     param($SslStream,[int] $TimeoutMs, [bool]$Diag)
-    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+    $readTimer = [System.Diagnostics.Stopwatch]::StartNew()
 
     # 1. Acquire the exact 4-byte framing envelope header
     $hdr = [byte[]]::new(4)
     $read = 0
     while ($read -lt 4) {
-        if ([DateTime]::UtcNow -ge $deadline) { throw "Timeout reading RADIUS framing header." }
-        $n = $SslStream.Read($hdr, $read, 4 - $read)
-        if ($n -eq 0) { throw "Socket terminated while acquiring framework parameters." }
+        $remainingMs = $TimeoutMs - [int]$readTimer.ElapsedMilliseconds
+        $n = Read-RadSecChunk -SslStream $SslStream -Buffer $hdr -Offset $read -Count (4 - $read) `
+            -TimeoutMs $remainingMs -TimeoutMessage "Timeout reading RADIUS framing header."
+        if ($n -eq 0) { throw [System.IO.EndOfStreamException]::new("Socket terminated while acquiring framework parameters.") }
         $read += $n
     }
 
@@ -1944,14 +1988,16 @@ function Read-RadiusPacket {
     }
 
     # 3. FORCE complete drainage of remaining bytes matching the declared payload structure
+    $readTimer.Restart()
     $remaining = $totalLen - 4
     $body = [byte[]]::new($remaining)
     $bodyRead = 0
     
     while ($bodyRead -lt $remaining) {
-        if ([DateTime]::UtcNow -ge $deadline) { throw "Timeout gathering multi-segment fragments. Got ($bodyRead/$remaining) bytes." }
-        $n = $SslStream.Read($body, $bodyRead, $remaining - $bodyRead)
-        if ($n -eq 0) { throw "Connection truncated during body context assembly." }
+        $remainingMs = $TimeoutMs - [int]$readTimer.ElapsedMilliseconds
+        $n = Read-RadSecChunk -SslStream $SslStream -Buffer $body -Offset $bodyRead -Count ($remaining - $bodyRead) `
+            -TimeoutMs $remainingMs -TimeoutMessage "Timeout gathering multi-segment fragments. Got ($bodyRead/$remaining) bytes."
+        if ($n -eq 0) { throw [System.IO.EndOfStreamException]::new("Connection truncated during body context assembly.") }
         $bodyRead += $n
     }
     
@@ -2465,11 +2511,18 @@ if ($DebugOutput.IsPresent) {
     Write-Host ""
 }
 
-$connection = $null
 # Start timer before connection setup so the reported metric reflects end-to-end runtime.
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+$maxTransientRadSecRetries = 1
+$transientRadSecAttempt = 0
+while ($true) {
+$pendingRadSecRetry = $false
+$packetExchangeInProgress = $false
+$connection = $null
+$engine = $null
+$script:OrionExitCode = $null
 try {
-    # Create transport connection once per script run, then reuse for all EAP rounds.
+    # Each retry creates a fresh transport and resets all EAP state.
     if ($Transport -eq "RADSEC") {
         $connection = New-TlsStream -Server $Server -Port $Port -RootCACertPath $RootCACertPath `
             -ClientCertPath $ClientCertPath -ClientCertPassword $ClientCertPassword `
@@ -2485,7 +2538,9 @@ try {
         $req = Build-AccessRequest -Username $Username -Password $Password -SharedSecret $SharedSecret `
             -NasIdentifier $NasIdentifier -NasPortId $NasPortId -NasPortType $NasPortType -NasIpAddress $NasIpAddress -CallingStationId $CallingStationId -CalledStationId $CalledStationId `
             -Identifier $rid -AuthType $AuthType
+        $packetExchangeInProgress = $true
         $respData = Send-AndReceiveRadiusPacket -Connection $connection -Packet $req -TransportMode $Transport -TimeoutMs $timeoutMs -Diag $DebugOutput.IsPresent -MaxRetries 2
+        $packetExchangeInProgress = $false
         $resp = Parse-RadiusResponse -Data $respData -Diag $DebugOutput.IsPresent
         $stopwatch.Stop()
         Write-AuthenticationSummary -Server $Server -Port $Port -Transport $Transport -AuthType $AuthType -Username $Username `
@@ -2546,6 +2601,7 @@ try {
     $incomingTlsData = [byte[]]::new(0)  # Accumulate fragmented server TLS data
     $serverTlsExpectedLen = $null        # Expected TLS bytes for current inbound message (from EAP-TLS L bit)
 
+    $eapCompleted = $false
     # Multi-round EAP state machine: send next request, parse challenge, produce next EAP payload.
     while ($round -lt $MaxEapRounds) {
         $round++
@@ -2568,7 +2624,9 @@ try {
             Write-Host " >> Access-Request(EAP) sent (round=$round, id=$rid, eapId=$eapId)" -ForegroundColor Yellow
         }
 
+        $packetExchangeInProgress = $true
         $respData = Send-AndReceiveRadiusPacket -Connection $connection -Packet $req -TransportMode $Transport -TimeoutMs $timeoutMs -Diag $DebugOutput.IsPresent -MaxRetries 2
+        $packetExchangeInProgress = $false
         $resp = Parse-RadiusResponse -Data $respData -Diag $DebugOutput.IsPresent
         if ($DebugOutput.IsPresent) {
             Write-Host " << Response: $($resp.CodeName) (round=$round)" -ForegroundColor Cyan
@@ -2588,6 +2646,7 @@ try {
             $stopwatch.Stop()
             Write-AuthenticationSummary -Server $Server -Port $Port -Transport $Transport -AuthType $AuthType -Username $Username `
                 -NasIdentifier $NasIdentifier -SharedSecret $SharedSecret -FinalResponse $resp.CodeName -ElapsedMilliseconds $stopwatch.ElapsedMilliseconds
+            $eapCompleted = $true
             break
         }
         if ($resp.Code -ne 11) { throw "Unexpected response code $($resp.Code)" }
@@ -2616,6 +2675,7 @@ try {
             }
             Write-AuthenticationSummary -Server $Server -Port $Port -Transport $Transport -AuthType $AuthType -Username $Username `
                 -NasIdentifier $NasIdentifier -SharedSecret $SharedSecret -FinalResponse "EAP-Failure" -ElapsedMilliseconds $stopwatch.ElapsedMilliseconds
+            $eapCompleted = $true
             break
         }
         if ($eapParsed.Code -eq 3) {
@@ -2625,6 +2685,7 @@ try {
             }
             Write-AuthenticationSummary -Server $Server -Port $Port -Transport $Transport -AuthType $AuthType -Username $Username `
                 -NasIdentifier $NasIdentifier -SharedSecret $SharedSecret -FinalResponse "EAP-Success" -ElapsedMilliseconds $stopwatch.ElapsedMilliseconds
+            $eapCompleted = $true
             break
         }
 
@@ -2666,13 +2727,21 @@ try {
                 $pipe = $engine.Pipe
                 $tlsTask = $engine.AuthTask
 
-                # Wait up to 1 second for SslStream to produce initial ClientHello data
-                $newOut = $pipe.TakeOutgoingWait(1000)
+                $newOut = [byte[]]::new(0)
+                $helloTimer = [System.Diagnostics.Stopwatch]::StartNew()
+                while ($newOut.Length -eq 0 -and -not $tlsTask.IsCompleted -and $helloTimer.ElapsedMilliseconds -lt $timeoutMs) {
+                    $waitMs = [Math]::Min(500, $timeoutMs - [int]$helloTimer.ElapsedMilliseconds)
+                    if ($waitMs -gt 0) { $newOut = $pipe.TakeOutgoingWait($waitMs) }
+                }
 
                 if ($tlsTask.IsCompleted -and $tlsTask.IsFaulted) {
                     $msg = $tlsTask.Exception
                     if ($msg.InnerException) { $msg = $msg.InnerException }
                     throw "Inner EAP-TLS handshake thread initialization failed completely: $($msg.Message)"
+                }
+                # A supported method must never fall through to the unsupported-method NAK.
+                if ($newOut.Length -eq 0) {
+                    throw "Inner TLS engine did not produce a ClientHello within $timeoutMs ms."
                 }
                 
                 $isEngineInitialized = $true
@@ -3015,7 +3084,6 @@ try {
                                     $ttlsUserLen = [System.Text.Encoding]::UTF8.GetByteCount($innerEapIdentity)
                                     $ttlsPassLen = [System.Text.Encoding]::UTF8.GetByteCount($Password)
                                     Write-Host (" [DBG] TTLS phase2 AVPs: User-Name({0} bytes), User-Password({1} bytes), TotalPayload={2} bytes" -f $ttlsUserLen, $ttlsPassLen, $ttlsPayload.Length) -ForegroundColor DarkGray
-                                    Write-Host (" [DBG] TTLS phase2 payload hex: {0}" -f (Bytes-ToHex $ttlsPayload)) -ForegroundColor DarkGray
                                 }
 
                                 $engine.Ssl.Write($ttlsPayload, 0, $ttlsPayload.Length)
@@ -3079,8 +3147,19 @@ try {
         Write-Host (" [WARN] Unsupported EAP type {0} ({1}). Sending EAP-NAK suggesting: {2}" -f $eapParsed.Type, $typeName, ($nakTypes -join ",")) -ForegroundColor Yellow
         $nextEap = New-EapNakResponse -Id $eapId -DesiredTypes $nakTypes
     }
+    if (-not $eapCompleted) {
+        throw "Maximum EAP rounds ($MaxEapRounds) reached without an authentication result."
+    }
+    break
 }
 catch {
+    if ($Transport -eq "RADSEC" -and $packetExchangeInProgress -and
+        (Test-RadSecStreamFault -Exception $_.Exception) -and $transientRadSecAttempt -lt $maxTransientRadSecRetries) {
+        $transientRadSecAttempt++
+        $pendingRadSecRetry = $true
+        Write-Warning ("RADSEC packet exchange failed: {0}. Reconnecting and restarting authentication (retry {1}/{2})." -f $_.Exception.Message, $transientRadSecAttempt, $maxTransientRadSecRetries)
+        continue
+    }
     if ($EmitResultObject.IsPresent) {
         throw
     }
@@ -3096,37 +3175,49 @@ catch {
         echo ("Message: {0}" -f $_.Exception.Message)
         exit 1
     }
+    break
 }
 finally {
+    # Closing the pipe first wakes blocked inner TLS/PEAP reads before disposing SslStream.
+    if ($engine) {
+        try { $engine.Pipe.Close() } catch { Write-Warning "Failed to close inner EAP pipe: $($_.Exception.Message)" }
+        try { $engine.Ssl.Dispose() } catch { Write-Warning "Failed to dispose inner EAP TLS stream: $($_.Exception.Message)" }
+    }
+    $script:PeapInnerReadTask = $null
+    $script:PeapInnerReadBuffer = $null
     if ($connection) {
         try { if ($connection.Ssl) { $connection.Ssl.Close() } } catch {}
         try { if ($connection.Tcp) { $connection.Tcp.Close() } } catch {}
         try { if ($connection.Udp) { $connection.Udp.Close() } } catch {}
     }
-    if ($script:DebugTranscriptStarted) {
-        try { Stop-Transcript | Out-Null } catch {}
-        $isFailureRun = ($null -eq $script:OrionExitCode) -or ([int]$script:OrionExitCode -ne 0)
-        if ($isFailureRun) {
-            $resultLabel = if ($null -ne $script:OrionExitCode -and [int]$script:OrionExitCode -eq 3) { "Reject" } else { "Failure" }
-            $safeServer = ($Server -replace '[^A-Za-z0-9\.\-]', '_')
-            # Include Port, Transport (RADSEC/RADIUS), and AuthType in the filename itself so
-            # failures can be triaged/filtered from a directory listing alone, without opening
-            # every file - e.g. to isolate periodic RADSEC-only failures.
-            $finalLogName = "PortnoxRadiusDebug_{0}_{1}_{2}_{3}_{4}_{5}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"), $safeServer, $Port, $Transport, $AuthType, $resultLabel
-            $finalLogPath = Join-Path $DebugLogDirectory $finalLogName
-            try {
-                Move-Item -LiteralPath $script:DebugTranscriptPath -Destination $finalLogPath -Force
-            } catch {
-                # Best-effort: leave the temp transcript file in place if the move fails.
+    if (-not $pendingRadSecRetry) {
+        $stopwatch.Stop()
+        if ($script:DebugTranscriptStarted) {
+            try { Stop-Transcript | Out-Null } catch {}
+            $isFailureRun = ($null -eq $script:OrionExitCode) -or ([int]$script:OrionExitCode -ne 0)
+            if ($isFailureRun) {
+                $resultLabel = if ($null -ne $script:OrionExitCode -and [int]$script:OrionExitCode -eq 3) { "Reject" } else { "Failure" }
+                $safeServer = ($Server -replace '[^A-Za-z0-9\.\-]', '_')
+                # Include Port, Transport (RADSEC/RADIUS), and AuthType in the filename itself so
+                # failures can be triaged/filtered from a directory listing alone, without opening
+                # every file - e.g. to isolate periodic RADSEC-only failures.
+                $finalLogName = "PortnoxRadiusDebug_{0}_{1}_{2}_{3}_{4}_{5}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"), $safeServer, $Port, $Transport, $AuthType, $resultLabel
+                $finalLogPath = Join-Path $DebugLogDirectory $finalLogName
+                try {
+                    Move-Item -LiteralPath $script:DebugTranscriptPath -Destination $finalLogPath -Force
+                } catch {
+                    # Best-effort: leave the temp transcript file in place if the move fails.
+                }
+            } else {
+                try { Remove-Item -LiteralPath $script:DebugTranscriptPath -Force -ErrorAction SilentlyContinue } catch {}
             }
-        } else {
-            try { Remove-Item -LiteralPath $script:DebugTranscriptPath -Force -ErrorAction SilentlyContinue } catch {}
+        }
+        if (-not $EmitResultObject.IsPresent -and -not $script:IsOrionMode) {
+            Write-Host "---------------------------------------------------" -ForegroundColor Cyan
+            Write-Host ""
         }
     }
-    if (-not $EmitResultObject.IsPresent -and -not $script:IsOrionMode) {
-        Write-Host "---------------------------------------------------" -ForegroundColor Cyan
-        Write-Host ""
-    }
+}
 }
 
 if (-not $EmitResultObject.IsPresent) {
