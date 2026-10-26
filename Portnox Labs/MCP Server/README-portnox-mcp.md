@@ -116,11 +116,15 @@ with request body:
 
 ## 1) Install
 
+The container uses Python 3.15 and MCP SDK 2.x. Local installations should use
+Python 3.12 or newer and the same locked requirements. MCP SDK 1.x is no longer
+supported by this version of the server.
+
 ```bash
 cd /Users/jeremy.morrill
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements-portnox-mcp.txt
+pip install --require-hashes -r requirements-portnox-mcp.txt
 ```
 
 ## 2) Configure environment
@@ -281,7 +285,7 @@ sudo cp "/Users/jeremy.morrill/MCP Server.py" /opt/portnox-mcp/
 sudo cp /Users/jeremy.morrill/requirements-portnox-mcp.txt /opt/portnox-mcp/
 cd /opt/portnox-mcp
 sudo python3 -m venv .venv
-sudo .venv/bin/pip install -r requirements-portnox-mcp.txt
+sudo .venv/bin/pip install --require-hashes -r requirements-portnox-mcp.txt
 sudo cp /Users/jeremy.morrill/portnox-mcp-server.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now portnox-mcp-server
@@ -314,10 +318,76 @@ printf '%s\n' 'YOUR_LONG_LIVED_TOKEN' > ./secrets/portnox_token.txt
 chmod 600 ./secrets/portnox_token.txt
 ```
 
-Start the container:
+Rebuild with a fresh base image and package indexes, then start the container:
 
 ```bash
-docker compose up -d --build
+docker compose build --pull --no-cache
+docker compose up -d
+```
+
+### Dependency updates and vulnerability checks
+
+Both build stages use `python:3.15-alpine3.24`, upgrade all Alpine packages, and
+install current certificates, OpenSSL, and zlib. Alpine 3.24 currently lags the
+musl security update, so the build also installs the patched musl package from
+Alpine's signed edge package repository. The runtime image removes pip, its
+vendored dependencies, setuptools, and ensurepip.
+
+`requirements-portnox-mcp.in` selects the direct dependency versions;
+`requirements-portnox-mcp.txt` locks the complete dependency graph with hashes.
+To update, select the latest stable compatible releases in the input file and
+regenerate the lock from this directory using [uv](https://docs.astral.sh/uv/):
+
+```bash
+uv pip compile requirements-portnox-mcp.in --upgrade --universal \
+  --python-version 3.15 --generate-hashes --output-file requirements-portnox-mcp.txt
+python3 -m pip install --require-hashes -r requirements-portnox-mcp.txt
+python3 -W default::DeprecationWarning -m unittest test_mcp_compatibility.py
+uv tool run pip-audit --disable-pip --no-deps -r requirements-portnox-mcp.txt
+docker build --pull --no-cache -t portnox-mcp:security-checked .
+trivy image --disable-telemetry --scanners vuln --exit-code 1 \
+  portnox-mcp:security-checked
+```
+
+Use [pip-audit](https://pypi.org/project/pip-audit/) for Python advisories and
+[Trivy](https://trivy.dev/) for the final image, including OS packages and
+bundled native libraries. Do not suppress unfixed advisories or severity levels
+when applying the no-known-vulnerabilities release check. Only deploy a rebuilt
+image after both scans and the compatibility tests pass. Scans reflect the
+advisory databases available at scan time, not a guarantee against future or
+undiscovered vulnerabilities. Changing these sources does not update an
+already-published image such as `portnox/portnox-mcp:latest`.
+
+Validated on October 14, 2026:
+
+- All 32 installed Python dependencies matched their latest PyPI releases;
+  pip-audit reported no known vulnerabilities.
+- ARM64 and AMD64 images built successfully. Trivy reported zero vulnerabilities
+  across 31 Alpine packages and 32 Python packages in each image.
+- The images contained OpenSSL `3.5.9-r0`, util-linux's libuuid `2.42.3-r1`,
+  zlib `1.3.2-r1`, PyJWT `2.15.1`, urllib3 `2.8.0`, and cryptography `50.0.2`.
+- All seven compatibility tests passed on Python 3.12.13 and 3.15.0.
+  Container smoke checks passed for stdio, SSE, Streamable HTTP (including
+  legacy protocol negotiation), and HTTPS with a generated self-signed
+  certificate. These checks used dummy credentials, not a live Portnox tenant.
+
+### Published container image
+
+The current security-updated image is available on
+[Docker Hub](https://hub.docker.com/r/portnox/portnox-mcp) as
+`portnox/portnox-mcp:latest`, supporting `linux/amd64` and `linux/arm64`. The
+versioned `1.0.5` tag remains the previous release.
+
+Published on October 26, 2026, with manifest digest:
+
+```text
+sha256:6b5b8434a797d548aa4f3b1c5e0a34b380e6ce0031a77690039fd29a26e14bd2
+```
+
+Pull the updated image before recreating an existing container:
+
+```bash
+docker pull portnox/portnox-mcp:latest
 ```
 
 ### HTTPS mode (auto self-signed cert)
@@ -334,7 +404,7 @@ docker run -d \
   -e PORTNOX_TOKEN="YOUR_LONG_LIVED_TOKEN" \
   --read-only \
   --tmpfs /tmp \
-  alt3r3g0/portnox-mcp:latest
+  portnox/portnox-mcp:latest
 ```
 
 ### HTTPS mode with PEM/CRT + KEY
@@ -354,7 +424,7 @@ docker run -d \
   -e PORTNOX_TOKEN="YOUR_LONG_LIVED_TOKEN" \
   --read-only \
   --tmpfs /tmp \
-  alt3r3g0/portnox-mcp:latest
+  portnox/portnox-mcp:latest
 ```
 
 ### HTTPS mode with PFX/P12 bundle
@@ -374,7 +444,7 @@ docker run -d \
   -e PORTNOX_TOKEN="YOUR_LONG_LIVED_TOKEN" \
   --read-only \
   --tmpfs /tmp \
-  alt3r3g0/portnox-mcp:latest
+  portnox/portnox-mcp:latest
 ```
 
 Stop it:
@@ -404,7 +474,7 @@ docker run -d \
   -e PORTNOX_VERIFY_TLS="true" \
   --read-only \
   --tmpfs /tmp \
-  alt3r3g0/portnox-mcp:latest
+  portnox/portnox-mcp:latest
 ```
 
 Because the server reads `PORTNOX_TOKEN_FILE` first and then falls back to
@@ -443,7 +513,7 @@ docker run -d \
   -e PORTNOX_VERIFY_TLS="true" \
   --read-only \
   --tmpfs /tmp \
-  alt3r3g0/portnox-mcp:latest
+  portnox/portnox-mcp:latest
 ```
 
 Security note:

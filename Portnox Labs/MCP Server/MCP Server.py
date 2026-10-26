@@ -122,7 +122,7 @@ from typing import Any, Dict, List, Optional  # Generic type hints.
 # ---------------------------------------------------------------------------
 import requests          # HTTP client used for all Portnox REST calls.
 import uvicorn           # ASGI server used to host the MCP app over HTTP.
-from mcp.server.fastmcp import FastMCP  # MCP server framework.
+from mcp.server import MCPServer  # MCP server framework.
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -3447,8 +3447,8 @@ class PortnoxClient:
 		)
 
 
-def build_server(client: PortnoxClient) -> FastMCP:
-	"""Construct and return a FastMCP server pre-loaded with all Portnox tools.
+def build_server(client: PortnoxClient) -> MCPServer:
+	"""Construct and return an MCP server pre-loaded with all Portnox tools.
 
 	All MCP tool functions are defined as inner functions (closures) here so
 	they automatically capture the `client` instance without needing it passed
@@ -3464,11 +3464,11 @@ def build_server(client: PortnoxClient) -> FastMCP:
 		client: An already-initialised PortnoxClient.
 
 	Returns:
-		A configured FastMCP instance ready to be run.
+		A configured MCPServer instance ready to be run.
 	"""
 	# Create the MCP server instance.  The name identifies the server to
 	# clients that connect to it.
-	mcp = FastMCP("portnox-mcp-server")
+	mcp = MCPServer("portnox-mcp-server")
 
 	@mcp.tool()
 	def list_nas_devices(mode: int = DEFAULT_MODE, info: int = DEFAULT_INFO) -> Dict[str, Any]:
@@ -7136,7 +7136,7 @@ def parse_args() -> argparse.Namespace:
 def _call_with_supported_kwargs(func: Any, preferred_kwargs: Dict[str, Any]) -> None:
 	"""Call `func` passing only the keyword arguments it actually accepts.
 
-	Different versions of the FastMCP SDK expose run methods with different
+	Different versions of the MCP SDK expose run methods with different
 	signatures.  Rather than maintaining a version-specific call per SDK release,
 	this helper inspects the function's signature at runtime and filters out any
 	kwargs that are not in the parameter list.  This avoids TypeError on unknown
@@ -7157,10 +7157,10 @@ def _call_with_supported_kwargs(func: Any, preferred_kwargs: Dict[str, Any]) -> 
 	func(**accepted_kwargs)
 
 
-def _discover_asgi_app(server: FastMCP, transport: str) -> Optional[Any]:
-	"""Attempt to obtain an ASGI application object from the FastMCP instance.
+def _discover_asgi_app(server: MCPServer, transport: str) -> Optional[Any]:
+	"""Attempt to obtain an ASGI application object from the MCPServer instance.
 
-	FastMCP SDK versions differ in which attribute or method exposes the ASGI
+	MCP SDK versions differ in which attribute or method exposes the ASGI
 	app for SSE and streamable-HTTP transports.  This function tries the
 	transport-specific methods first (most precise), then falls back to generic
 	ASGI app accessors.  Returns None if no ASGI app can be found, in which case
@@ -7173,7 +7173,7 @@ def _discover_asgi_app(server: FastMCP, transport: str) -> Optional[Any]:
 	  reliable way to bind to the correct interface.
 
 	Args:
-		server:    The FastMCP instance.
+		server:    The MCPServer instance.
 		transport: The transport name ("sse" or "streamable-http").
 
 	Returns:
@@ -7329,7 +7329,7 @@ class _HostHeaderRewriteApp:
 
 
 def run_server_transport(
-	server: FastMCP,
+	server: MCPServer,
 	transport: str,
 	host: str,
 	port: int,
@@ -7339,9 +7339,9 @@ def run_server_transport(
 	tls_cert_file: Optional[str] = None,
 	tls_key_file: Optional[str] = None,
 ) -> None:
-	"""Start the FastMCP server using the specified transport.
+	"""Start the MCP server using the specified transport.
 
-	This function is intentionally tolerant of different FastMCP SDK versions.
+	This function is intentionally tolerant of different MCP SDK versions.
 	The SDK's API has changed between releases and different installations may
 	have different capabilities.  The resolution order is:
 
@@ -7353,7 +7353,7 @@ def run_server_transport(
 	  5. Last resort: call server.run(transport) positionally.
 
 	Args:
-		server:            The FastMCP server instance to run.
+		server:            The MCPServer instance to run.
 		transport:         One of "stdio", "sse", "streamable-http".
 		host:              IP address to bind for network transports.
 		port:              TCP port to bind for network transports.
@@ -7408,7 +7408,7 @@ def run_server_transport(
 
 	if https_enabled:
 		raise RuntimeError(
-			"HTTPS mode requires ASGI app discovery for explicit uvicorn hosting, but no ASGI app was exposed by this FastMCP version."
+			"HTTPS mode requires ASGI app discovery for explicit uvicorn hosting, but no ASGI app was exposed by this MCP SDK version."
 		)
 
 	# --- Strategy 2: transport-specific run methods ---

@@ -1,4 +1,4 @@
-FROM python:3.12-alpine AS builder
+FROM python:3.15-alpine3.24 AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -11,16 +11,19 @@ WORKDIR /app
 RUN python -m venv "$VIRTUAL_ENV"
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-RUN apk add --no-cache ca-certificates openssl
+RUN apk upgrade --no-cache \
+    && apk add --no-cache ca-certificates "openssl>=3.5.8-r0" "zlib>=1.3.2-r1" \
+    && apk add --no-cache --repository https://dl-cdn.alpinelinux.org/alpine/edge/main "musl>=1.2.6-r6"
 
 COPY requirements-portnox-mcp.txt /app/requirements-portnox-mcp.txt
 RUN python -m pip install --upgrade pip \
-    && python -m pip install -r /app/requirements-portnox-mcp.txt \
-    && rm -f "$VIRTUAL_ENV"/bin/pip "$VIRTUAL_ENV"/bin/pip3 "$VIRTUAL_ENV"/bin/pip3.12 \
+    && python -m pip install --require-hashes -r /app/requirements-portnox-mcp.txt \
+    && python -m pip check \
+    && rm -f "$VIRTUAL_ENV"/bin/pip "$VIRTUAL_ENV"/bin/pip3 "$VIRTUAL_ENV"/bin/pip3.15 \
     && find "$VIRTUAL_ENV"/lib -path '*/site-packages/pip*' -exec rm -rf {} + \
     && find "$VIRTUAL_ENV"/lib -path '*/site-packages/setuptools*' -exec rm -rf {} +
 
-FROM python:3.12-alpine
+FROM python:3.15-alpine3.24
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -29,9 +32,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-RUN apk add --no-cache ca-certificates openssl
+RUN apk upgrade --no-cache \
+    && apk add --no-cache ca-certificates "openssl>=3.5.8-r0" "zlib>=1.3.2-r1" \
+    && apk add --no-cache --repository https://dl-cdn.alpinelinux.org/alpine/edge/main "musl>=1.2.6-r6"
 
-RUN rm -f /usr/local/bin/pip /usr/local/bin/pip3 /usr/local/bin/pip3.12 \
+RUN rm -f /usr/local/bin/pip /usr/local/bin/pip3 /usr/local/bin/pip3.15 \
     && find /usr/local/lib -path '*/site-packages/pip*' -exec rm -rf {} + \
     && find /usr/local/lib -path '*/site-packages/setuptools*' -exec rm -rf {} + \
     && find /usr/local/lib -path '*/ensurepip*' -exec rm -rf {} +
